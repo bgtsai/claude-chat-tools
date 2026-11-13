@@ -1,0 +1,60 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>mock claude</title>
+<style>
+ body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+ body.light{--bg:#faf9f5;--fg:#1f1f1f} body.dark{--bg:#262624;--fg:#eee}
+ [data-testid=chat-header]{height:48px;display:flex;align-items:center;padding:0 16px;border-bottom:1px solid #8884}
+ .crumb{display:flex;align-items:center;gap:6px}
+ [data-testid=session-title-split]{display:flex;align-items:center}
+ h2{margin:0;font-size:inherit}
+ .tbtn{font:14px system-ui;background:none;border:0;color:inherit;padding:4px 8px;border-radius:6px;cursor:pointer;display:inline-flex}
+ .tbtn:hover{background:#8883}
+ .more{width:28px;height:28px}
+ /* 真實頁面（2026-11-12 量）：可改名的標題按鈕與內層 span 都是 cursor:text */
+ .ttl,.ttl span{cursor:text} /* 用 class，複製出去的按鈕也帶著（真實頁面是 tailwind class） */
+ [data-testid=chat-input]{min-height:60px;border:1px solid #8886;margin:40px;padding:8px;border-radius:12px}
+</style></head>
+<body class="light">
+<div id="app"></div>
+<script>
+/* 依 2026-11-11 從 claude.ai 抓到的結構做的模擬頁：標題按鈕點了進入改名、Enter 送出後整個標題區重繪；
+   點 Project 連結是單頁換頁；Project 頁的編輯器吃 paste；送出後換到新對話，2 秒後自動標題才出現。 */
+const PROJ='/project/019dcf9d-cf82-75d7-bcc3-c291415b7b64';
+const names=JSON.parse(sessionStorage.getItem('mockNames')||'{}');
+const save=()=>sessionStorage.setItem('mockNames',JSON.stringify(names));
+window.__mock={names,opts:JSON.parse(sessionStorage.getItem('mockOpts')||'{}')};
+if(!names['c5d4d1cb-b313-4674-be05-527b63d04d61']){names['c5d4d1cb-b313-4674-be05-527b63d04d61']=window.__mock.opts.start||'自動交接對話串';save();}
+if(window.__mock.opts.dark)document.body.className='dark';
+function el(t,a={},...k){const e=document.createElement(t);for(const[x,y]of Object.entries(a)){if(x==='on')for(const[ev,f]of Object.entries(y))e.addEventListener(ev,f);else e.setAttribute(x,y)}e.append(...k);return e}
+function go(p){history.pushState({},'',p);render()}
+function render(){
+ const app=document.getElementById('app');app.replaceChildren();
+ const p=location.pathname;
+ if(p.startsWith('/chat/')){
+  const id=p.slice(6);
+  const header=el('div',{'data-testid':'chat-header'});
+  const crumb=el('div',{class:'crumb'},el('a',{'data-cds':'Button',href:PROJ,on:{click:e=>{e.preventDefault();go(PROJ)}}},el('span',{},el('span',{'data-cds-part':'paint'})),el('span',{},el('span',{},'小程式集合'))),el('span',{},'/'));
+  const holder=el('div');crumb.append(holder);header.append(crumb);app.append(header);
+  const drawTitle=()=>{holder.replaceChildren();const n=names[id]||'';if(!n)return;
+   const split=el('div',{'data-testid':'session-title-split'},
+    el('h2',{},el('button',{class:'tbtn ttl','data-cds':'Button',type:'button','aria-label':n+'，重新命名工作階段',on:{click:edit}},el('span',{},el('span',{'data-cds-part':'paint'})),el('span',{},el('span',{},n)))),
+    el('span'),el('button',{class:'tbtn more','aria-label':n+' 的更多選項','aria-haspopup':'menu','aria-expanded':'false','data-cds':'Button',type:'button'},el('span',{},'⌄')));
+   holder.append(split)};
+  const edit=()=>{holder.replaceChildren();const inp=el('input',{'aria-label':'工作階段名稱','data-testid':'name-session','data-cds':'TextInput',type:'text'});inp.value=names[id];
+   inp.addEventListener('keydown',e=>{if(e.key==='Enter'){names[id]=inp.value;save();drawTitle()}else if(e.key==='Escape')drawTitle()});holder.append(inp);inp.focus()};
+  window.__mock.redrawTitle=drawTitle;drawTitle();
+  app.append(el('div',{role:'textbox','data-testid':'chat-input',contenteditable:'true','aria-label':'撰寫您要傳送給 Claude 的提示'},el('p',{},el('br'))));
+ } else if(p.startsWith('/project/')){
+  if(window.__mock.opts.noEditor){app.append(el('div',{},'（模擬：Project 頁沒有輸入框）'));return}
+  const ed=el('div',{role:'textbox','data-testid':'chat-input',contenteditable:'true','aria-label':'撰寫您要傳送給 Claude 的提示'},el('p',{},window.__mock.opts.draft||el('br')));
+  // 模擬真實編輯器：貼上的文字接在既有內容後面（殘留的草稿不會被取代）
+  ed.addEventListener('paste',e=>{e.preventDefault();const t=e.clipboardData.getData('text/plain');const keep=[...ed.children].filter(c=>c.textContent.trim());ed.replaceChildren(...keep,...t.split('\n').map(l=>el('p',{},l||el('br'))));slot.replaceChildren(sendBtn)});
+  const slot=el('div',{'data-cds-part':'send-slot'});
+  const sendBtn=el('button',{'aria-label':'傳送訊息',type:'button',on:{click:()=>{window.__mock.sent=ed.innerText;const nid='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';names[nid]='';save();go('/chat/'+nid);
+    setTimeout(()=>{names[nid]='新工作階段';save();window.__mock.redrawTitle()},300);
+    setTimeout(()=>{names[nid]='Claude 自動取的標題';save();window.__mock.redrawTitle()},2000);}}},'↑');
+  app.append(el('div',{},'在 小程式集合 中新增工作階段'),ed,slot);
+ }
+}
+addEventListener('popstate',render);render();
+</script></body></html>
