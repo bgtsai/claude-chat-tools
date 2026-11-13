@@ -3,10 +3,11 @@
 2026-11-13 在「小程式集合」對話串定案（那串原本在做 VoiceInputTW v1.7.0）。新 repo 建好後，把這份搬進新 repo 根目錄的 CLAUDE.md，這個分支資料夾就可以刪。
 
 ## 目前狀態（2026-11-13）
+- v0.2.1：手動〔校正〕後也補送〔自動〕已校正用量（手動校正）（使用者定案：讓 Claude 當下判斷要不要換串）。
 - v0.2.0：自動續做、/context 後補送、自動交接、自動允許授權、面板三段（照 mockup 1–3、6–9 區）。v0.1.0 是三支合併、功能不變。
 - 用量沿用 localStorage `ccm:` 前綴，舊設定不用搬。新鍵：`ccm:opt`（thr／onStop／autoHandoff／autoAllow）、`cont:<cid>`（已回覆的〔續做〕訊息）、`autoctx:<cid>`（同一輪只送一次 /context）、`await:<cid>`（自動停下且要交接）、`ready:<cid>`、`ahn`（連續自動交接次數，手動交接歸零）、`allowlog:<cid>`。
 - 模組之間用外層的 `TOOLS`：`TOOLS.meter`（state、opts、load/save）、`TOOLS.handover.run(text, {auto})`。
-- 測試：`cd tests && python3 server.py &`，再 `python3 test.py ../ClaudeChatTools.user.js`、`test_ui.py`、`test_tag.py`、`test_auto.py`（同參數，21 項×2 引擎）、`python3 test_grid.py`、`python3 test_handover.py chromium firefox`。test_auto 的 9 條規則都用改壞版反證過。
+- 測試：`cd tests && python3 server.py &`，再 `python3 test.py ../ClaudeChatTools.user.js`、`test_ui.py`、`test_tag.py`、`test_auto.py`（同參數，23 項×2 引擎）、`python3 test_grid.py`、`python3 test_handover.py chromium firefox`。test_auto 的 9 條規則都用改壞版反證過。
 - **還沒做**：換串成本實測（交接前後量新舊串的工具呼叫成本，存 `ccm:hcost`）——目前用「公式 × 2.5」；/context 輸出只解析一次（用量讀對話樹、方格圖讀畫面，來源不同，暫不合）；真實頁面實測（含授權按鈕的真實樣子）。
 - 知識庫 01 第⑫條（換串公式、〔續做〕／〔交接就緒〕寫法）還沒改，等使用者同意。
 

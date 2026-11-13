@@ -63,6 +63,14 @@ with sync_playwright() as p:
     chk('記錄',pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowlog:%s')||'[]').length"%CID)==1);b.close()
     b,pg=page(p,name,base(),pre=box)
     chk('預設關不按',pg.evaluate('window.__c||[]')==[]);b.close()
+    # 手動〔校正〕後也補送
+    b,pg=page(p,name,base(('assistant','好')))
+    pg.click('#ccm-badge');pg.wait_for_timeout(300);pg.click('.ccm-calib');pg.wait_for_timeout(2500)
+    s0=sent(pg);put(base(('assistant','好'),('human','/context'),('assistant',CTX('420k','260k'))));poke(pg)
+    s=sent(pg);chk('手動校正後補送',s0==['/context'] and len(s)==2 and s[1].startswith('〔自動〕已校正用量（手動校正）。') and '[ctx 42%' in s[1],s);b.close()
+    b,pg=page(p,name,base(('assistant','好')))
+    pg.click('#ccm-badge');pg.wait_for_timeout(300);pg.click('.ccm-calib');pg.wait_for_timeout(3500);poke(pg);pg.wait_for_timeout(4000)
+    s=sent(pg);chk('手動校正逾時照送',len(s)==2 and '校正失敗，用估算（手動校正）' in s[1],s);b.close()
     # 面板
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300)

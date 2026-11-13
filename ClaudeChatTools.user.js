@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.2.0
+// @version      0.2.1
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.2.0';
+    const TOOLS_VERSION = '0.2.1';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -283,7 +283,21 @@
         state.contLog = { t: Date.now(), msg: msg.split('\n')[0], ok };
     }
     // 回傳 true＝這一輪由續做流程處理（含要不要送 /context），一般的自動 /context 不再插手
+    // 手動〔校正〕之後也補送一則（使用者定案 2026-11-13）：Claude 才能當下拿新數字判斷要不要換串，不必等使用者下一次開口
+    function manualFollow(cid, calib) {
+        const p = state.pendManual;
+        if (!p || p.cid !== cid) return false;
+        const got = calib && calib.idx > p.idx;
+        if (!got && Date.now() - p.t <= CFG.CTX_WAIT_MS) {
+            if (!state.pendTimer) state.pendTimer = setTimeout(() => { state.pendTimer = null; scheduleRefresh(); }, CFG.CTX_WAIT_MS + 500);
+            return true;
+        }
+        state.pendManual = null;
+        fillSend(AUTO_PREFIX + (got ? '已校正用量（手動校正）。' : '校正失敗，用估算（手動校正）。') + '\n' + tagText(), '校正補送');
+        return true;
+    }
     function autoFlow(cid, trunk, calib) {
+        if (manualFollow(cid, calib)) return true;
         if (state.pendCont && state.pendCont.cid === cid) {
             const p = state.pendCont;
             const got = calib && calib.idx > p.info.idx;
@@ -429,7 +443,11 @@
         b.setAttribute('aria-disabled', off ? 'true' : 'false');
         const why = row(typing && !busy ? '輸入框有字，先送出或清空' : '', 'color:' + (d ? '#ffd37a' : '#9a5b00'));
         why.className = 'ccm-why';
-        b.addEventListener('click', () => { if (!off) sendContext('校正'); });
+        b.addEventListener('click', () => {
+            if (off) return;
+            const cid = (location.pathname.match(CHAT_RE) || [])[1], idx = state.last && state.last.calib ? state.last.calib.idx : -1;
+            sendContext('校正').then(ok => { if (ok && cid) state.pendManual = { cid, idx, t: Date.now() }; });
+        });
         act.append(b, why);
         parts.push(act);
         parts.push(...autoSections(d, dim, line));
