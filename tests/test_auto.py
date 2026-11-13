@@ -56,6 +56,11 @@ with sync_playwright() as p:
     chk('字數不對不動作',pg.evaluate("!document.querySelector('.cho-toast')&&window.__ccm.err&&window.__ccm.err.includes('交接就緒')"));b.close()
     b,pg=page(p,name,base(('assistant',rdy(len(op)))))
     chk('關著亮「可以交接了」',pg.evaluate("document.querySelector('.cho-btn').textContent.trim()")=='可以交接了');b.close()
+    # 手動交接：await=manual 時，自動交接開關關著也接著開新串；等待中按鈕顯示「交接準備中…」
+    b,pg=page(p,name,base(('assistant',rdy(len(op)))),pre="localStorage.setItem('ccm:await:%s','\"manual\"')"%CID)
+    chk('手動交接請求後自動接續',pg.evaluate("!!document.querySelector('.cho-toast')&&document.querySelector('.cho-toast').innerText.includes('自動交接沒有執行')"));b.close()
+    b,pg=page(p,name,base(('assistant','做中')),pre="localStorage.setItem('ccm:await:%s','\"manual\"')"%CID)
+    chk('等待中按鈕文字',pg.evaluate("document.querySelector('.cho-btn').textContent.trim()")=='交接準備中…',pg.evaluate("document.querySelector('.cho-btn').textContent.trim()"));b.close()
     # 自動允許
     box="document.addEventListener('DOMContentLoaded',()=>{const d=document.createElement('div');d.innerHTML='<p>Claude 要讀取 bgtsai/x</p><button onclick=\"window.__c=(window.__c||[]).concat(1)\">允許一次</button><button onclick=\"window.__c=(window.__c||[]).concat(2)\">一律允許</button><button>拒絕</button>';document.body.append(d);const e=document.createElement('div');e.innerHTML='<button onclick=\"window.__c=(window.__c||[]).concat(9)\">Allow</button>';document.body.append(e)})"
     b,pg=page(p,name,base(),opt={'autoAllow':True},pre=box)

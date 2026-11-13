@@ -43,7 +43,9 @@ function render(){
   const edit=()=>{holder.replaceChildren();const inp=el('input',{'aria-label':'工作階段名稱','data-testid':'name-session','data-cds':'TextInput',type:'text'});inp.value=names[id];
    inp.addEventListener('keydown',e=>{if(e.key==='Enter'){names[id]=inp.value;save();drawTitle()}else if(e.key==='Escape')drawTitle()});holder.append(inp);inp.focus()};
   window.__mock.redrawTitle=drawTitle;drawTitle();
-  app.append(el('div',{role:'textbox','data-testid':'chat-input',contenteditable:'true','aria-label':'撰寫您要傳送給 Claude 的提示'},el('p',{},el('br'))));
+  const ced=el('div',{role:'textbox','data-testid':'chat-input',contenteditable:'true','aria-label':'撰寫您要傳送給 Claude 的提示'},el('p',{},el('br')));
+  // 對話頁也有送出鈕（v0.3.0：手動交接會在舊對話代送請求）
+  app.append(ced,el('div',{'data-cds-part':'send-slot'},el('button',{'aria-label':'傳送訊息',type:'button',on:{click:()=>{window.__mock.sent=ced.innerText;ced.replaceChildren(el('p',{},el('br')))}}},'↑')));
  } else if(p.startsWith('/project/')){
   if(window.__mock.opts.noEditor){app.append(el('div',{},'（模擬：Project 頁沒有輸入框）'));return}
   const ed=el('div',{role:'textbox','data-testid':'chat-input',contenteditable:'true','aria-label':'撰寫您要傳送給 Claude 的提示'},el('p',{},window.__mock.opts.draft||el('br')));

@@ -62,13 +62,17 @@ def run(bname, p):
     page.click('.cho-btn')
     page.wait_for_selector('.cho-dialog')
     txt = page.inner_text('.cho-dialog')
-    check(f'{tag} 對話框內容', '(old)自動交接對話串_V1' in txt and '自動交接對話串_V2' in txt and '第二行說明' in txt and '第三行' not in txt and '共 4 行' in txt, txt.replace('\n', ' | '))
+    check(f'{tag} 按鈕：對話框說明會先請 Claude 準備', '(old)自動交接對話串_V1' in txt and '自動交接對話串_V2' in txt and '先請 Claude 歸檔' in txt, txt.replace('\n', ' | '))
+    page.keyboard.press('Escape')
+    page.evaluate('t=>{window.__cho.run(t)}', CLIP); page.wait_for_selector('.cho-dialog')
+    txt = page.inner_text('.cho-dialog')
+    check(f'{tag} 有開場白時的對話框內容', '第二行說明' in txt and '第三行' not in txt and '共 4 行' in txt, txt.replace('\n', ' | '))
     page.screenshot(path=str(SHOTS / f'{tag}_2_dialog.png'))
     # Esc 取消
     page.keyboard.press('Escape')
     check(f'{tag} Esc 關閉', page.query_selector('.cho-mask') is None)
     # 4) 全流程
-    page.click('.cho-btn'); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
+    page.evaluate('t=>{window.__cho.run(t)}', CLIP); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
     t0 = time.time()
     page.wait_for_selector('.cho-toast:has-text("交接完成")', timeout=40000)
     names = page.evaluate('()=>window.__mock.names')
@@ -80,16 +84,18 @@ def run(bname, p):
     page.screenshot(path=str(SHOTS / f'{tag}_3_done.png'))
     print(f'    全流程 {time.time()-t0:.1f} 秒')
     ctx.close()
-    # 5) 剪貼簿空的
-    ctx, page = new_page(b, clip='  ')
-    page.wait_for_selector('.cho-btn'); page.click('.cho-btn'); page.wait_for_selector('.cho-dialog')
-    dis = page.eval_on_selector('.cho-dialog button:has-text("確認")', 'b=>b.disabled')
-    check(f'{tag} 空剪貼簿擋下', dis and '剪貼簿是空的' in page.inner_text('.cho-dialog'))
+    # 5) 沒有開場白時按鈕 → 代送交接請求、按鈕顯示「交接準備中…」（v0.3.0 拿掉剪貼簿）
+    ctx, page = new_page(b)
+    page.wait_for_selector('.cho-btn'); page.click('.cho-btn'); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
+    page.wait_for_selector('.cho-toast:has-text("已請 Claude")', timeout=10000); page.wait_for_timeout(800)
+    sent = page.evaluate('()=>window.__mock.sent') or ''
+    aw = page.evaluate("localStorage.getItem('ccm:await:c5d4d1cb-b313-4674-be05-527b63d04d61')")
+    check(f'{tag} 代送交接請求並記下等待', '〔自動〕請歸檔、準備交接內容' in sent and aw == '"manual"', repr(sent) + ' ' + repr(aw))
     page.screenshot(path=str(SHOTS / f'{tag}_4_empty.png'))
     ctx.close()
     # 6) 中途失敗 → 還原舊名稱（整頁回舊對話）
     ctx, page = new_page(b, opts={'noEditor': True})
-    page.wait_for_selector('.cho-btn'); page.click('.cho-btn'); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
+    page.wait_for_selector('.cho-btn'); page.evaluate('t=>{window.__cho.run(t)}', CLIP); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
     page.wait_for_selector('.cho-toast:has-text("卡在")', timeout=20000)
     page.screenshot(path=str(SHOTS / f'{tag}_5_fail.png'))
     page.click('.cho-toast button:has-text("還原舊名稱")')
@@ -98,7 +104,7 @@ def run(bname, p):
     ctx.close()
     # 7) 輸入框原本有字：先存起來、清空再貼，完成後可以複製回來
     ctx, page = new_page(b, opts={'draft': '之前打了沒送出的字 x'})
-    page.wait_for_selector('.cho-btn'); page.click('.cho-btn'); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
+    page.wait_for_selector('.cho-btn'); page.evaluate('t=>{window.__cho.run(t)}', CLIP); page.wait_for_selector('.cho-dialog'); page.click('.cho-dialog button:has-text("確認")')
     page.wait_for_selector('.cho-toast:has-text("交接完成")', timeout=40000)
     sent = page.evaluate('()=>window.__mock.sent')
     check(f'{tag} 殘留草稿被清掉', sent and '沒送出' not in sent and sent.replace('\n','').replace(' ','') == CLIP.replace('\n','').replace(' ',''), repr(sent))

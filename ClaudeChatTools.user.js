@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.2.1
+// @version      0.3.0
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.2.1';
+    const TOOLS_VERSION = '0.3.0';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -60,14 +60,23 @@
     const CHAT_RE = /\/chat\/([0-9a-f-]{36})/;
     const CTX_HEAD = '## Context' + ' Usage'; // 拆開寫：避免本檔被別的工具用文字搜尋時誤判
     const SEL = {
-        input: '[data-testid="chat-input"]', send: 'button[data-testid="chat-input-send"]',
+        input: '[data-testid="chat-input"]', send: 'button[data-testid="chat-input-send"], [data-cds-part="send-slot"] button', // 第二個是備援（同交接模組）
         titleSplit: '[data-testid="session-title-split"]', // 頁首「標題 ⌄」那一排（跟 claude-chat-handover 同一組選擇器）
         moreBtn: 'button[aria-haspopup="menu"]',          // 標題旁的 ⌄
     };
 
     const state = { orgId: null, last: null, err: null, autoPending: false };
     const SWITCH_FACTOR = () => { const h = load('hcost', null); return h && h.factor ? h.factor : CFG.SWITCH_COST_FACTOR; };
-    TOOLS.meter = { state, opts: () => opts(), save: (k, v) => save(k, v), load: (k, d) => load(k, d) };
+    const curCid = () => (location.pathname.match(CHAT_RE) || [])[1] || '';
+    TOOLS.meter = { state, opts: () => opts(), save: (k, v) => save(k, v), load: (k, d) => load(k, d),
+        isWaiting: () => load('await:' + curCid(), 0) === 'manual',
+        // 手動交接：代送請求，記下「等〔交接就緒〕」；成功回 true
+        requestHandoff: async () => {
+            const cid = curCid(); if (!cid) return false;
+            const ok = await fillSend(AUTO_PREFIX + '請歸檔、準備交接內容，完成後用〔交接就緒〕格式附上開場白。\n' + tagText(), '交接請求');
+            if (ok) save('await:' + cid, 'manual');
+            return ok;
+        } };
     window.__ccm = state; // 給除錯用（Claude in Chrome 讀得到）
 
     const load = (k, d) => { try { const v = localStorage.getItem(LS + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
@@ -339,7 +348,9 @@
         save('ready:' + cid, last.uuid);
         state.handoffText = bm[1];
         const o = opts(), n = load('ahn', 0);
-        if (o.autoHandoff && load('await:' + cid, 0) && n < CFG.AUTO_HANDOFF_MAX && TOOLS.handover) {
+        const aw = load('await:' + cid, 0);
+        if (aw === 'manual' && TOOLS.handover) { save('await:' + cid, 0); TOOLS.handover.run(bm[1], { auto: true }); }
+        else if (aw && o.autoHandoff && n < CFG.AUTO_HANDOFF_MAX && TOOLS.handover) {
             save('ahn', n + 1); save('await:' + cid, 0);
             TOOLS.handover.run(bm[1], { auto: true });
         }
@@ -1226,7 +1237,8 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
       } else {
         row('舊對話串改名', info.oldName === info.current ? `${info.current}（已是這個名稱，不改）` : `${info.current}  →  ${info.oldName}`);
         row('新對話串（建立在「' + info.project + '」）', info.newName);
-        row(`交接文字（共 ${info.lineCount} 行）`, info.preview, c.sub);
+        if (info.request) row('接下來', '先請 Claude 歸檔、準備交接內容；它寫好開場白後，自動開新對話串並送出', c.sub);
+        else row(`交接文字（共 ${info.lineCount} 行）`, info.preview, c.sub);
       }
 
       const btns = document.createElement('div');
@@ -1274,19 +1286,14 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
     const auto = !!(opt && opt.auto);
     const M = TOOLS.meter;
     if (!given && M && M.state.handoffText) given = M.state.handoffText;
+    // 手動按、還沒有開場白：先請 Claude 歸檔、準備交接；〔交接就緒〕出來後由用量模組接著自動開新串（使用者定案 2026-11-13，拿掉剪貼簿）
+    const request = !given && !auto;
     const current = getTitle();
     const link = getProjectLink();
     const errors = [];
-    let text = '';
-    if (given) text = given;
-    else {
-      try {
-        text = (await navigator.clipboard.readText()) || '';
-      } catch (e) {
-        errors.push('讀不到剪貼簿：' + (e && e.message ? e.message : e) + '（請允許網站讀取剪貼簿）');
-      }
-    }
-    if (!errors.length && !text.trim()) errors.push(given ? '讀到的開場白是空的' : '剪貼簿是空的：請先複製交接文字');
+    const text = given || '';
+    if (!request && !text.trim()) errors.push('讀到的開場白是空的');
+    if (request && M && M.isWaiting()) errors.push('已經請 Claude 準備交接了，等它寫好〔交接就緒〕');
     if (!current) errors.push('讀不到目前對話串的名稱');
     if (!link) errors.push('這個對話串不在 Project 裡（標題列沒有 Project 連結）');
 
@@ -1294,11 +1301,17 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
     const lines = text.replace(/\r\n/g, '\n').split('\n');
     const nonEmpty = lines.filter((l) => l.trim());
     const preview = nonEmpty.slice(0, 2).join('\n') + (nonEmpty.length > 2 ? '\n…' : '');
-    const info = { current, ...names, project: link ? link.textContent.trim() : '', preview, lineCount: lines.length, errors };
+    const info = { current, ...names, project: link ? link.textContent.trim() : '', preview, lineCount: lines.length, errors, request };
 
     if (auto) { if (errors.length) { toast(['自動交接沒有執行', ...errors], 'err'); return; } }
     else if (!(await confirmDialog(info))) return;
     if (!auto && M) M.save('ahn', 0); // 手動交接：連續自動交接次數歸零（使用者定案）
+    if (request) {
+      if (!M || !(await M.requestHandoff())) toast(['沒有送出交接請求', (M && M.state.err) || '輸入框有字或找不到送出鈕'], 'err');
+      else toast(['已請 Claude 歸檔並準備交接', '寫好開場白後會自動開新對話串'], 'info');
+      refreshLabel();
+      return;
+    }
     if (M) M.state.handoffText = null;
     running = true; refreshLabel();
     const oldUrl = location.href;
@@ -1431,7 +1444,8 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
   function refreshLabel() {
     const b = document.querySelector('.cho-btn'); if (!b) return;
     const M = TOOLS.meter, ready = !!(M && M.state.handoffText);
-    const label = running ? '交接中…' : ready ? '可以交接了' : '交接對話串';
+    const waiting = !!(M && M.isWaiting());
+    const label = running ? '交接中…' : ready ? '可以交接了' : waiting ? '交接準備中…' : '交接對話串';
     const spans = [...b.querySelectorAll('span')].filter((x) => !x.children.length && x.textContent.trim());
     const tgt = spans.length ? spans[spans.length - 1] : b;
     if (tgt.textContent !== label) tgt.textContent = label;
@@ -1444,7 +1458,7 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
   }
   setInterval(refreshLabel, 500);
   TOOLS.handover = { run: (text, o) => onHandoverClick(text, o) };
-  window.__cho = { VERSION, computeNames };
+  window.__cho = { VERSION, computeNames, run: (t, o) => onHandoverClick(t, o) }; // run：測試用
   log(`v${VERSION} 已載入`);
     });
 

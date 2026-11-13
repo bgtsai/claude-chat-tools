@@ -3,17 +3,18 @@
 2026-11-13 在「小程式集合」對話串定案（那串原本在做 VoiceInputTW v1.7.0）。新 repo 建好後，把這份搬進新 repo 根目錄的 CLAUDE.md，這個分支資料夾就可以刪。
 
 ## 目前狀態（2026-11-13）
+- v0.3.0：手動按「交接對話串」→ 確認一次 → 代送「〔自動〕請歸檔、準備交接內容，完成後用〔交接就緒〕格式附上開場白。」→ 記 `await:<cid>`=`"manual"`、按鈕顯示「交接準備中…」→〔交接就緒〕出來後不管自動交接開關都接著開新串。拿掉剪貼簿（使用者定案）。用量模組的送出鈕選擇器加備援 `[data-cds-part="send-slot"] button`。
 - v0.2.1：手動〔校正〕後也補送〔自動〕已校正用量（手動校正）（使用者定案：讓 Claude 當下判斷要不要換串）。
 - v0.2.0：自動續做、/context 後補送、自動交接、自動允許授權、面板三段（照 mockup 1–3、6–9 區）。v0.1.0 是三支合併、功能不變。
 - 用量沿用 localStorage `ccm:` 前綴，舊設定不用搬。新鍵：`ccm:opt`（thr／onStop／autoHandoff／autoAllow）、`cont:<cid>`（已回覆的〔續做〕訊息）、`autoctx:<cid>`（同一輪只送一次 /context）、`await:<cid>`（自動停下且要交接）、`ready:<cid>`、`ahn`（連續自動交接次數，手動交接歸零）、`allowlog:<cid>`。
 - 模組之間用外層的 `TOOLS`：`TOOLS.meter`（state、opts、load/save）、`TOOLS.handover.run(text, {auto})`。
-- 測試：`cd tests && python3 server.py &`，再 `python3 test.py ../ClaudeChatTools.user.js`、`test_ui.py`、`test_tag.py`、`test_auto.py`（同參數，23 項×2 引擎）、`python3 test_grid.py`、`python3 test_handover.py chromium firefox`。test_auto 的 9 條規則都用改壞版反證過。
+- 測試：`cd tests && python3 server.py &`，再 `python3 test.py ../ClaudeChatTools.user.js`、`test_ui.py`、`test_tag.py`、`test_auto.py`（同參數，25 項×2 引擎）、`python3 test_grid.py`、`python3 test_handover.py chromium firefox`（40 項）。test_auto 的 9 條規則都用改壞版反證過。
 - **還沒做**：換串成本實測（交接前後量新舊串的工具呼叫成本，存 `ccm:hcost`）——目前用「公式 × 2.5」；/context 輸出只解析一次（用量讀對話樹、方格圖讀畫面，來源不同，暫不合）；真實頁面實測（含授權按鈕的真實樣子）。
 - 知識庫 01 第⑫條（換串公式、〔續做〕／〔交接就緒〕寫法）還沒改，等使用者同意。
 
 ## Claude 這邊怎麼配合（腳本認的格式）
 - 一批做完、草稿推送後，回覆**最後一行**：`〔續做〕下一批：<名稱>；預估 <N> 萬；剩 <M> 批（含這批）`。只用在使用者已同意的分批計畫；要他決定的事照常問，不寫這行。
-- 收到 `〔自動〕停：…` 且第二行要準備交接時：歸檔、寫交接、推送，然後回覆裡寫一行 `〔交接就緒〕開場白 <N> 字`，下面接**唯一一個**程式碼區塊放開場白；N 是區塊內文的字數（Python `len()`，不含 ``` 那兩行）。整則回覆只能有這一個程式碼區塊。
+- 收到 `〔自動〕停：…` 且第二行要準備交接時，或收到 `〔自動〕請歸檔、準備交接內容…`（使用者按了交接鈕）時：歸檔、寫交接、推送，然後回覆裡寫一行 `〔交接就緒〕開場白 <N> 字`，下面接**唯一一個**程式碼區塊放開場白；N 是區塊內文的字數（Python `len()`，不含 ``` 那兩行）。整則回覆只能有這一個程式碼區塊。
 
 ## 由來
 - VoiceInputTW v1.7.0 那串，我在同一輪裡連做五批（13:08～13:35），用量從 29% 一路到約 96.7 萬自動壓縮：用量標記只附在使用者訊息上、提醒只在我回覆結尾，一輪裡沒有任何量測點。
