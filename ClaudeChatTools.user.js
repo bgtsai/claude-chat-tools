@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.1.0
+// @version      0.2.0
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,8 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.1.0';
+    const TOOLS_VERSION = '0.2.0';
+    const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
     // ════════ 模組一：上下文用量（原 claude-context-meter v0.4.0）════════
@@ -44,8 +45,12 @@
         AUTO_FIRST_MIN_MSGS: 2,       // 沒有校正點時，至少幾則訊息才送
         AUTO_RECHECK_PCT: 0.65,       // 估算到這個用量、且上次校正低於 AUTO_RECHECK_BELOW 時再送一次
         AUTO_RECHECK_BELOW: 0.60,
-        AUTO_MAX_PER_CHAT: 3,
-        AUTO_MIN_GAP_MS: 15 * 60 * 1000,
+        CONT_MAX: 15,                 // 連續自動續做上限（可能在空轉）
+        CONT_NEAR_PCT: 0.05,          // 加上下一批後離門檻不到這麼多 → 先送 /context 校正再判斷
+        CTX_WAIT_MS: 30000,           // 代送 /context 後等輸出的上限；逾時照估算判斷並照送
+        CALLS_PER_BATCH: 30,          // 沒有前幾批可平均時，每批的工具呼叫次數（估計值）
+        SWITCH_COST_FACTOR: 2.5,      // 換串成本＝公式 × 這個倍數（沒實測資料時；交接檔：約公式的 2～3 倍）
+        AUTO_HANDOFF_MAX: 5,          // 連續自動交接上限；手動交接歸零（使用者定案）
         TAG_ON_SEND: true,            // 送出訊息時在尾端附用量標記，讓 Claude 每輪讀得到（使用者定案，2026-11-12）
         REFRESH_THROTTLE_MS: 1500,    // 同一輪結束常連續觸發好幾次，合併成一次（節流，不是防手震）
     };
@@ -61,6 +66,8 @@
     };
 
     const state = { orgId: null, last: null, err: null, autoPending: false };
+    const SWITCH_FACTOR = () => { const h = load('hcost', null); return h && h.factor ? h.factor : CFG.SWITCH_COST_FACTOR; };
+    TOOLS.meter = { state, opts: () => opts(), save: (k, v) => save(k, v), load: (k, d) => load(k, d) };
     window.__ccm = state; // 給除錯用（Claude in Chrome 讀得到）
 
     const load = (k, d) => { try { const v = localStorage.getItem(LS + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
@@ -156,10 +163,14 @@
         state.last = { cid, t: Date.now(), C: Math.round(C), pct, win, fixed: Math.round(fixed), k: +k.toFixed(3), estNow: Math.round(estNow), msgs: trunk.length,
             calib: calib ? { total: calib.total, messages: calib.messages, idx: calib.idx, ago: trunk.length - 1 - calib.idx } : null,
             source: calib ? '此對話串的 /context' : (g ? '其他對話串的校正' : '預設值'), B: Math.round(B), nStar, switchWorth };
+        const ci = contInfo(trunk);
+        if (ci) { const calls = ci.left * callsPerBatch(trunk), ns = nStar * SWITCH_FACTOR(); state.last.cont = { left: ci.left, calls, nStar: ns, switchWorth: calls >= ns }; }
+        state.last.autoN = autoCount(trunk);
+        state.last.continuing = !!ci || (trunk.length && trunk[trunk.length - 1].sender === 'human' && textOf(trunk[trunk.length - 1]).trim().startsWith(AUTO_PREFIX + '繼續'));
         state.err = null;
         warnIfNeeded(cid, pct);
         render();
-        maybeAutoContext(cid, trunk.length, pct, calib);
+        if (!autoFlow(cid, trunk, calib)) maybeAutoContext(cid, trunk, pct, calib);
     }
 
     // ── 3. 提醒：70% 起每 +10% 一次；換串划算時標示 ──
@@ -172,41 +183,154 @@
         state.flash = Date.now();
     }
 
-    // ── 4. 自動送 /context ──
-    async function maybeAutoContext(cid, nMsgs, pct, calib) {
-        if (!CFG.AUTO_CTX || state.autoPending) return;
-        const rec = load('auto:' + cid, { n: 0, t: 0 });
-        if (rec.n >= CFG.AUTO_MAX_PER_CHAT || Date.now() - rec.t < CFG.AUTO_MIN_GAP_MS) return;
+    // ── 4. 自動 /context：同一輪只送一次（取代舊的「每串 3 次、間隔 15 分鐘」，使用者定案 2026-11-13）──
+    async function maybeAutoContext(cid, trunk, pct, calib) {
+        if (!CFG.AUTO_CTX || state.autoPending || state.pendCont) return;
+        const nMsgs = trunk.length, lastU = trunk.length ? trunk[trunk.length - 1].uuid : '';
+        if (load('autoctx:' + cid, '') === lastU) return;
         const need = (!calib && nMsgs >= CFG.AUTO_FIRST_MIN_MSGS)
             || (calib && pct >= CFG.AUTO_RECHECK_PCT && calib.total / calib.win < CFG.AUTO_RECHECK_BELOW);
         if (!need) return;
         const ed = document.querySelector(SEL.input);
         if (!ed || ed.innerText.trim()) return; // 使用者有沒送出的字就不動，下一輪再說
-        if (await sendContext('自動 /context')) save('auto:' + cid, { n: rec.n + 1, t: Date.now() });
+        if (await sendContext('自動 /context')) save('autoctx:' + cid, lastU);
     }
-    // 送一次 /context（自動與〔校正〕共用）；輸入框有字時不送。成功回 true
-    async function sendContext(who) {
+    // 把一段文字填進輸入框並送出（/context、〔自動〕訊息共用）；輸入框有字時不送。成功回 true
+    async function fillSend(text, who) {
         const ed = document.querySelector(SEL.input);
         if (!ed || ed.innerText.trim() || state.autoPending) return false;
         state.autoPending = true; render();
+        const norm = s => s.replace(/\s+/g, '');
         try {
             ed.focus();
-            const dt = new DataTransfer(); dt.setData('text/plain', '/context');
+            const dt = new DataTransfer(); dt.setData('text/plain', text);
             ed.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
             await sleep(300);
-            if (!ed.innerText.trim().startsWith('/context')) document.execCommand('insertText', false, '/context');
+            if (norm(ed.innerText) !== norm(text)) { clearEd(ed); document.execCommand('insertText', false, text); }
             await sleep(300);
-            if (ed.innerText.trim() !== '/context') { state.err = who + '：填入失敗'; return false; }
+            if (norm(ed.innerText) !== norm(text)) { state.err = who + '：填入失敗'; return false; }
             const btn = document.querySelector(SEL.send);
             if (!btn) { state.err = who + '：找不到送出鈕'; return false; }
-            btn.click();
+            passSend = true; try { btn.click(); } finally { passSend = false; }
             await sleep(1500);
             if (ed.innerText.trim()) { state.err = who + '：送出後輸入框沒清空'; return false; }
-            state.calibWait = { idx: state.last && state.last.calib ? state.last.calib.idx : -1, t: Date.now() };
             return true;
         } finally { state.autoPending = false; render(); }
     }
+    function clearEd(ed) { const s = getSelection(); s.selectAllChildren(ed); document.execCommand('delete', false); }
+    async function sendContext(who) {
+        const ok = await fillSend('/context', who);
+        if (ok) state.calibWait = { idx: state.last && state.last.calib ? state.last.calib.idx : -1, t: Date.now() };
+        return ok;
+    }
     const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    // ── 4b. 自動續做（交接檔「已定案・自動續做」；mockup 1–5、9 區）──
+    // Claude 一批做完，回覆最後一行寫〔續做〕；腳本讀對話樹判斷用量，以使用者身分送〔自動〕繼續／停。
+    // 只是看用量，不是新的授權：Claude 只在使用者已同意的分批計畫裡寫〔續做〕。
+    const CONT_RE = /^〔續做〕下一批：(.+?)；預估\s*([\d.]+)\s*萬；剩\s*(\d+)\s*批/;
+    const READY_RE = /^〔交接就緒〕開場白\s*(\d+)\s*字\s*$/m;
+    const AUTO_PREFIX = '〔自動〕';
+    const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false };
+    const opts = () => Object.assign({}, OPT_DEF, load('opt', {}));
+    const setOpt = (k, v) => { const o = load('opt', {}); o[k] = v; save('opt', o); render(); };
+    const effOnStop = o => (o.thr >= 0.85 ? 'draft' : o.onStop); // 85% 時剩下的空間來不及歸檔
+    const textOf = m => (m.content || []).filter(b => b.type === 'text').map(b => b.text || '').join('\n');
+    const lastLine = t => { const a = t.trim().split('\n'); return a[a.length - 1].trim(); };
+    // 使用者最後一則自己打的訊息：human、不是〔自動〕、不是 / 指令
+    function lastUserIdx(trunk) {
+        for (let i = trunk.length - 1; i >= 0; i--) {
+            const m = trunk[i]; if (m.sender !== 'human') continue;
+            const t = textOf(m).trim(); if (!t.startsWith(AUTO_PREFIX) && !t.startsWith('/')) return i;
+        }
+        return -1;
+    }
+    const autoCount = trunk => trunk.slice(lastUserIdx(trunk) + 1).filter(m => m.sender === 'human' && textOf(m).trim().startsWith(AUTO_PREFIX + '繼續')).length;
+    // 一批＝兩則 human 之間所有助理訊息的工具呼叫；只算以〔續做〕結尾的批，取平均（一輪＝重讀一次上下文）
+    function callsPerBatch(trunk) {
+        const batches = []; let n = 0, lastTxt = '';
+        for (const m of trunk) {
+            if (m.sender === 'human') { if (CONT_RE.test(lastLine(lastTxt))) batches.push(n); n = 0; lastTxt = ''; continue; }
+            n += (m.content || []).filter(b => b.type === 'tool_use').length; const t = textOf(m); if (t.trim()) lastTxt = t;
+        }
+        const recent = batches.slice(-3);
+        return recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : CFG.CALLS_PER_BATCH;
+    }
+    function contInfo(trunk) {
+        const last = trunk[trunk.length - 1];
+        if (!last || last.sender !== 'assistant') return null;
+        const cm = lastLine(textOf(last)).match(CONT_RE);
+        return cm ? { uuid: last.uuid, idx: trunk.length - 1, name: cm[1], est: parseFloat(cm[2]) * 1e4, left: +cm[3] } : null;
+    }
+    const P = x => Math.round(x * 100);
+    function stopLine2(kind) {
+        if (kind === 'max') return '記好草稿與進度，然後停下來等我。';
+        return { draft: '記好草稿與進度，然後停下來等我。', archive: '先歸檔，然後停下來等我。', handoff: '先歸檔，再準備交接內容，然後停下來等我。' }[effOnStop(opts())];
+    }
+    async function decide(cid, trunk, info, note) {
+        save('cont:' + cid, info.uuid);
+        const L = state.last, o = opts(), n = autoCount(trunk);
+        const after = L.pct + info.est / L.win;
+        const c = L.cont || {};
+        let stop = null, kind = '';
+        if (after >= o.thr) { kind = 'thr'; stop = '現在 ' + P(L.pct) + '%，加上下一批約 ' + P(after) + '%，超過門檻 ' + P(o.thr) + '%。'; }
+        else if (c.switchWorth) { kind = 'switch'; stop = '建議換串。剩 ' + info.left + ' 批約 ' + Math.round(c.calls) + ' 次工具呼叫，換新對話串約 ' + Math.ceil(c.nStar) + ' 次後回本。'; }
+        else if (n >= CFG.CONT_MAX) { kind = 'max'; stop = '已經連續自動續做 ' + CFG.CONT_MAX + ' 次，可能在空轉。'; }
+        const tail = note ? note : '';
+        const msg = stop ? AUTO_PREFIX + '停：' + stop + tail + '\n' + stopLine2(kind) : AUTO_PREFIX + '繼續（第 ' + (n + 1) + ' 次）。' + tail;
+        const ok = await fillSend(msg + '\n' + tagText(), '自動續做');
+        if (ok && stop && kind !== 'max' && effOnStop(o) === 'handoff' && o.autoHandoff) save('await:' + cid, 1);
+        state.contLog = { t: Date.now(), msg: msg.split('\n')[0], ok };
+    }
+    // 回傳 true＝這一輪由續做流程處理（含要不要送 /context），一般的自動 /context 不再插手
+    function autoFlow(cid, trunk, calib) {
+        if (state.pendCont && state.pendCont.cid === cid) {
+            const p = state.pendCont;
+            const got = calib && calib.idx > p.info.idx;
+            if (got || Date.now() - p.t > CFG.CTX_WAIT_MS) { state.pendCont = null; decide(cid, trunk, p.info, got ? '已校正用量。' : '（校正失敗，用估算）'); }
+            else if (!state.pendTimer) state.pendTimer = setTimeout(() => { state.pendTimer = null; scheduleRefresh(); }, CFG.CTX_WAIT_MS + 500);
+            return true;
+        }
+        const last = trunk[trunk.length - 1];
+        if (last && last.sender === 'assistant') { const t = textOf(last), rm = t.match(READY_RE); if (rm) { handleReady(cid, last, t, rm); return true; } }
+        const info = contInfo(trunk);
+        if (!info) return false;
+        if (load('cont:' + cid, '') === info.uuid) return true; // 同一則回覆只回一次
+        const ed = document.querySelector(SEL.input);
+        if (!ed || ed.innerText.trim()) return true;           // 使用者在打字：不動
+        const L = state.last, o = opts();
+        const near = L.pct + info.est / L.win >= o.thr - CFG.CONT_NEAR_PCT;
+        const fresh = calib && calib.idx > lastUserIdx(trunk);
+        // 離門檻近、或這串還沒有任何校正（新串量起點）→ 先代送 /context，輸出出現後一定補送〔自動〕訊息（mockup 9 區）
+        if ((near || !calib) && !fresh && load('autoctx:' + cid, '') !== info.uuid) {
+            save('autoctx:' + cid, info.uuid);
+            state.pendCont = { cid, t: Date.now(), info };
+            sendContext('續做校正').then(ok => { if (!ok && state.pendCont) { state.pendCont = null; decide(cid, trunk, info, '（校正失敗，用估算）'); } });
+            return true;
+        }
+        decide(cid, trunk, info, '');
+        return true;
+    }
+
+    // ── 4c. 自動交接：讀〔交接就緒〕下面的程式碼區塊（不經剪貼簿）──
+    function handleReady(cid, last, txt, rm) {
+        if (load('ready:' + cid, '') === last.uuid) return;
+        const N = +rm[1];
+        const all = txt.match(/```[^\n]*\n[\s\S]*?\n```/g) || [];
+        const bm = txt.slice(txt.indexOf(rm[0]) + rm[0].length).match(/```[^\n]*\n([\s\S]*?)\n```/);
+        if (all.length !== 1 || !bm || [...bm[1]].length !== N) {
+            state.err = '交接就緒：開場白要剛好一個程式碼區塊、' + N + ' 字（讀到 ' + all.length + ' 個、' + (bm ? [...bm[1]].length : 0) + ' 字），不動作';
+            render(); return; // 不記成已處理：每輪重檢、錯誤訊息一直留著
+        }
+        save('ready:' + cid, last.uuid);
+        state.handoffText = bm[1];
+        const o = opts(), n = load('ahn', 0);
+        if (o.autoHandoff && load('await:' + cid, 0) && n < CFG.AUTO_HANDOFF_MAX && TOOLS.handover) {
+            save('ahn', n + 1); save('await:' + cid, 0);
+            TOOLS.handover.run(bm[1], { auto: true });
+        }
+        render();
+    }
 
     // ── 5. 頁首標籤：⌄ 右邊、「交接對話串」左邊 ──
     // 那一排是 claude.ai 框架管的；重繪會把我們的節點清掉，所以用 MutationObserver 補插（做法同 claude-chat-handover）。
@@ -241,8 +365,8 @@
         if (!L) { el.textContent = '—'; el.title = state.err || ''; paint('normal'); renderStrip(null); renderPanel(); return; }
         el.textContent = Math.round(L.pct * 100) + '%' + (L.switchWorth ? '・建議換串' : '');
         el.title = '點一下看詳細資料';
-        paint(L.pct >= CFG.HIGH_PCT ? 'high' : (L.pct >= CFG.WARN_PCT || L.switchWorth) ? 'warn' : 'normal');
-        renderStrip(L.pct >= CFG.HIGH_PCT ? 'red' : L.pct >= CFG.WARN_PCT ? 'yellow' : L.switchWorth ? 'blue' : null);
+        paint(L.pct >= opts().thr ? 'high' : (L.pct >= CFG.WARN_PCT || L.switchWorth) ? 'warn' : 'normal');
+        renderStrip(L.pct >= opts().thr ? 'red' : L.pct >= CFG.WARN_PCT ? 'yellow' : L.switchWorth ? 'blue' : null);
         renderPanel();
     }
 
@@ -274,8 +398,8 @@
         const L = state.last, d = isDark();
         const r = el.getBoundingClientRect();
         const fg = d ? '#eeeeee' : '#1f1f1f', dim = d ? '#a6a6a6' : '#767676', line = d ? 'rgba(255,255,255,.16)' : 'rgba(0,0,0,.10)';
-        panel.style.cssText = 'position:fixed;z-index:2147483646;box-sizing:border-box;width:340px;padding:12px 14px;border-radius:8px;'
-            + 'font-size:14px;line-height:20px;left:' + Math.round(r.left) + 'px;top:' + Math.round(r.bottom + 8) + 'px;'
+        panel.style.cssText = 'position:fixed;z-index:2147483646;box-sizing:border-box;width:344px;padding:12px 14px;border-radius:8px;'
+            + 'font-size:14px;line-height:20px;left:' + Math.round(r.left) + 'px;top:' + Math.round(r.bottom + 8) + 'px;max-height:calc(100vh - ' + Math.round(r.bottom + 24) + 'px);overflow:auto;'
             + 'background:' + (d ? '#30302e' : '#f4f4f2') + ';color:' + fg + ';border:1px solid ' + line + ';box-shadow:0 4px 16px rgba(0,0,0,' + (d ? '.5' : '.14') + ')';
         const busy = state.autoPending || !!state.calibWait;
         const ed = document.querySelector(SEL.input);
@@ -308,7 +432,86 @@
         b.addEventListener('click', () => { if (!off) sendContext('校正'); });
         act.append(b, why);
         parts.push(act);
+        parts.push(...autoSections(d, dim, line));
         panel.replaceChildren(...parts);
+    }
+    // ── 6b. 面板的「自動續做」「自動交接」「自動允許授權」三段（mockup 1–3、6–7 區）──
+    // 分段選項照語音輸入法設定頁的 .seg（選中 65×28、間距 16、框圓角 12、選中圓角 9；03 第㉒節）
+    function seg(d, items, cur, onPick, disabled) {
+        const box = document.createElement('div');
+        box.className = 'ccm-seg';
+        box.style.cssText = 'display:inline-flex;gap:16px;padding:3px;border-radius:12px;background:' + (d ? 'rgba(255,255,255,.07)' : 'rgba(0,0,0,.05)') + ';border:1px solid ' + (d ? 'rgba(255,255,255,.10)' : 'rgba(0,0,0,.08)');
+        for (const [v, label] of items) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.textContent = label; b.dataset.v = String(v);
+            const on = v === cur, off = disabled && disabled.includes(v);
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+            if (off) b.setAttribute('aria-disabled', 'true');
+            b.style.cssText = 'width:65px;height:28px;padding:0;border:0;border-radius:9px;font:inherit;font-size:13px;line-height:1;white-space:nowrap;cursor:' + (off ? 'default' : 'pointer') + ';'
+                + (on ? 'background:' + (d ? '#F5F5F7' : '#1D1D1F') + ';color:' + (d ? '#1B1B1F' : '#FFFFFF') + ';box-shadow:0 1px 3px rgba(0,0,0,.25)'
+                      : 'background:none;color:' + (off ? (d ? '#6b6b69' : '#b3b3b0') : (d ? '#a6a6a6' : '#767676')));
+            b.addEventListener('click', e => { e.stopPropagation(); if (!off && !on) onPick(v); });
+            box.append(b);
+        }
+        return box;
+    }
+    function toggle(d, on, dis, onFlip, label) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.setAttribute('role', 'switch'); b.setAttribute('aria-checked', on ? 'true' : 'false'); b.setAttribute('aria-label', label);
+        if (dis) b.setAttribute('aria-disabled', 'true');
+        b.style.cssText = 'position:relative;flex:0 0 auto;width:36px;height:20px;padding:0;border:0;border-radius:10px;cursor:' + (dis ? 'default' : 'pointer') + ';opacity:' + (dis ? '.45' : '1') + ';background:' + (on ? (d ? '#F5F5F7' : '#1D1D1F') : (d ? 'rgba(255,255,255,.25)' : 'rgba(0,0,0,.25)'));
+        const k = document.createElement('span');
+        k.style.cssText = 'position:absolute;top:2px;left:' + (on ? 18 : 2) + 'px;width:16px;height:16px;border-radius:8px;background:' + (on ? (d ? '#1B1B1F' : '#FFFFFF') : (d ? '#30302e' : '#f4f4f2'));
+        b.append(k);
+        b.addEventListener('click', e => { e.stopPropagation(); if (!dis) onFlip(!on); });
+        return b;
+    }
+    function autoSections(d, dim, line) {
+        const o = opts(), L = state.last || {}, warnC = d ? '#ffd37a' : '#9a5b00';
+        const div = (css, txt) => { const x = document.createElement('div'); x.style.cssText = css || ''; if (txt != null) x.textContent = txt; return x; };
+        const small = (txt, c) => div('font-size:13px;line-height:18px;color:' + (c || dim), txt);
+        const head = (label, status, sw) => {
+            const h = div('display:flex;justify-content:space-between;align-items:center;gap:8px');
+            const l = div('display:flex;align-items:center;gap:8px'); if (sw) l.append(sw); l.append(label);
+            h.append(l, Object.assign(small(status), { className: 'ccm-status' })); return h;
+        };
+        const out = [];
+        // 自動續做
+        const s1 = div('margin-top:12px;padding-top:12px;border-top:1px solid ' + line); s1.className = 'ccm-sec-cont';
+        s1.append(head('自動續做', L.continuing ? '續做中・已自動 ' + (L.autoN || 0) + ' 次（上限 ' + CFG.CONT_MAX + '）' : '沒有在續做'));
+        s1.append(div('margin-top:10px', '停止門檻'), small('加上下一批的預估後超過就停；紅燈也照這條線'));
+        const t = div('margin-top:8px'); t.append(seg(d, [[0.70, '70%'], [0.75, '75%'], [0.80, '80%'], [0.85, '85%']], o.thr, v => setOpt('thr', v))); s1.append(t);
+        s1.append(div('margin-top:14px', '停下來時'), small('到門檻、建議換串、連續自動 ' + CFG.CONT_MAX + ' 次都會停'));
+        const hi = o.thr >= 0.85;
+        const u = div('margin-top:8px'); u.append(seg(d, [['draft', '只記草稿'], ['archive', '先歸檔'], ['handoff', '歸檔交接']], effOnStop(o), v => setOpt('onStop', v), hi ? ['archive', 'handoff'] : null)); s1.append(u);
+        if (hi) s1.append(Object.assign(small('門檻 85% 時剩下的空間來不及歸檔，只能只記草稿', warnC), { style: 'margin-top:6px;font-size:13px;line-height:18px;color:' + warnC }));
+        out.push(s1);
+        // 自動交接
+        const s2 = div('margin-top:12px;padding-top:12px;border-top:1px solid ' + line); s2.className = 'ccm-sec-handoff';
+        const n = load('ahn', 0), canH = effOnStop(o) === 'handoff';
+        const st = !o.autoHandoff || !canH ? '沒有開啟' : n >= CFG.AUTO_HANDOFF_MAX ? '已達上限 ' + CFG.AUTO_HANDOFF_MAX + ' 次，下次要手動交接' : '已自動交接 ' + n + ' 次（上限 ' + CFG.AUTO_HANDOFF_MAX + '）';
+        s2.append(head('自動交接', st, toggle(d, o.autoHandoff && canH, !canH, v => setOpt('autoHandoff', v), '自動交接')));
+        s2.append(canH ? small('手動按「交接對話串」會把次數歸零') : Object.assign(small('「停下來時」選「歸檔交接」才能自動交接', warnC), { style: 'margin-top:6px;font-size:13px;line-height:18px;color:' + warnC }));
+        out.push(s2);
+        // 自動允許授權
+        const s3 = div('margin-top:12px;padding-top:12px;border-top:1px solid ' + line); s3.className = 'ccm-sec-allow';
+        const cid = (location.pathname.match(CHAT_RE) || [])[1] || '';
+        const logs = load('allowlog:' + cid, []);
+        s3.append(head('自動允許授權', '本串已代按 ' + logs.length + ' 次', toggle(d, o.autoAllow, false, v => setOpt('autoAllow', v), '自動允許授權')));
+        if (logs.length) {
+            const lst = div('margin-top:6px;font-size:13px;line-height:20px');
+            (panel.__allLogs ? logs.slice().reverse() : logs.slice(-3).reverse()).forEach(x => lst.append(div('', x.time + ' ' + x.what)));
+            s3.append(lst);
+            if (logs.length > 3) {
+                const more = document.createElement('button'); more.type = 'button'; more.textContent = panel.__allLogs ? '只顯示最近 3 筆' : '顯示全部';
+                more.style.cssText = 'margin-top:4px;padding:0;border:0;background:none;font:inherit;font-size:13px;color:' + dim + ';text-decoration:underline;cursor:pointer';
+                more.addEventListener('click', e => { e.stopPropagation(); panel.__allLogs = !panel.__allLogs; renderPanel(); });
+                s3.append(more);
+            }
+        }
+        s3.append(small('只會按 claude.ai 畫面上的「允許」按鈕（有「一律允許」就按它）；需要你在對話裡親口同意的授權，腳本處理不了'));
+        out.push(s3);
+        return out;
     }
     // 面板開著時，輸入框打字／清空要即時反映到〔校正〕的停用狀態
     setInterval(() => {
@@ -1047,18 +1250,25 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
   // ---------- 主流程 ----------
   let running = false;
 
-  async function onHandoverClick() {
+  // given：從對話樹讀到的開場白（〔交接就緒〕下面的區塊）；有它就不讀剪貼簿。opt.auto：自動交接，不跳確認框。
+  async function onHandoverClick(given, opt) {
     if (running) return;
+    const auto = !!(opt && opt.auto);
+    const M = TOOLS.meter;
+    if (!given && M && M.state.handoffText) given = M.state.handoffText;
     const current = getTitle();
     const link = getProjectLink();
     const errors = [];
     let text = '';
-    try {
-      text = (await navigator.clipboard.readText()) || '';
-    } catch (e) {
-      errors.push('讀不到剪貼簿：' + (e && e.message ? e.message : e) + '（請允許網站讀取剪貼簿）');
+    if (given) text = given;
+    else {
+      try {
+        text = (await navigator.clipboard.readText()) || '';
+      } catch (e) {
+        errors.push('讀不到剪貼簿：' + (e && e.message ? e.message : e) + '（請允許網站讀取剪貼簿）');
+      }
     }
-    if (!errors.length && !text.trim()) errors.push('剪貼簿是空的：請先複製交接文字');
+    if (!errors.length && !text.trim()) errors.push(given ? '讀到的開場白是空的' : '剪貼簿是空的：請先複製交接文字');
     if (!current) errors.push('讀不到目前對話串的名稱');
     if (!link) errors.push('這個對話串不在 Project 裡（標題列沒有 Project 連結）');
 
@@ -1068,8 +1278,11 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
     const preview = nonEmpty.slice(0, 2).join('\n') + (nonEmpty.length > 2 ? '\n…' : '');
     const info = { current, ...names, project: link ? link.textContent.trim() : '', preview, lineCount: lines.length, errors };
 
-    if (!(await confirmDialog(info))) return;
-    running = true;
+    if (auto) { if (errors.length) { toast(['自動交接沒有執行', ...errors], 'err'); return; } }
+    else if (!(await confirmDialog(info))) return;
+    if (!auto && M) M.save('ahn', 0); // 手動交接：連續自動交接次數歸零（使用者定案）
+    if (M) M.state.handoffText = null;
+    running = true; refreshLabel();
     const oldUrl = location.href;
     let step = '';
     let oldRenamed = false;
@@ -1121,7 +1334,7 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
       }
       toast([`卡在「${step}」`, String(e && e.message ? e.message : e), oldRenamed ? `舊對話串已改成「${info.oldName}」` : '舊對話串沒有被改動', ...draftLines()], 'err', actions);
     } finally {
-      running = false;
+      running = false; refreshLabel();
     }
   }
 
@@ -1179,6 +1392,7 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
     // 按鈕要顯示手指指標，內層 span 也要一起蓋掉，否則移到字上又變回 I 字形。
     for (const el of [b, ...b.querySelectorAll('*')]) el.style.cursor = 'pointer';
     b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onHandoverClick(); }, true);
+    b.dataset.ready = '';
     // 用量標籤（browser-tools/claude-context-meter 的 .ccm-meter）也掛在 ⌄ 後面，順序固定為 ⌄ → 用量 → 交接；
     // 兩支腳本各自補插時才不會互換位置。
     const meter = more.nextElementSibling;
@@ -1195,7 +1409,60 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
   resumeRestore();
 
   // 測試用的進入點（不影響正常使用）
+  // 交接鈕的三種樣子（mockup 8 區）：平常／收到〔交接就緒〕但自動交接關著 →「可以交接了」（藍）／執行中 →「交接中…」
+  function refreshLabel() {
+    const b = document.querySelector('.cho-btn'); if (!b) return;
+    const M = TOOLS.meter, ready = !!(M && M.state.handoffText);
+    const label = running ? '交接中…' : ready ? '可以交接了' : '交接對話串';
+    const spans = [...b.querySelectorAll('span')].filter((x) => !x.children.length && x.textContent.trim());
+    const tgt = spans.length ? spans[spans.length - 1] : b;
+    if (tgt.textContent !== label) tgt.textContent = label;
+    const want = ready && !running ? '1' : '';
+    if ((b.dataset.ready || '') !== want) {
+      b.dataset.ready = want;
+      if (want) { b.style.background = '#2c84db'; b.style.color = '#ffffff'; b.style.border = '1px solid #2c84db'; }
+      else { b.style.background = 'color-mix(in srgb, currentColor 6%, transparent)'; b.style.color = ''; b.style.border = '1px solid color-mix(in srgb, currentColor 35%, transparent)'; }
+    }
+  }
+  setInterval(refreshLabel, 500);
+  TOOLS.handover = { run: (text, o) => onHandoverClick(text, o) };
   window.__cho = { VERSION, computeNames };
   log(`v${VERSION} 已載入`);
+    });
+
+    // ════════ 模組四：自動允許授權（面板開關，預設關）════════
+    // 只按 claude.ai 畫面上「允許／拒絕」成對出現的那組按鈕；有「一律允許」類的優先按它（使用者：允許一次要反覆按、拖慢速度）。
+    // 選擇器還沒看過真實畫面（使用者尚未截圖），所以用文字比對＋旁邊要有「拒絕」類按鈕，避免按到別的「允許」。
+    whenReady(function () {
+        const ALLOW_ALL = /^(一律允許|永遠允許|總是允許|全部允許|允許全部|始終允許|Always allow|Allow always|Allow all|Allow for this (chat|session|conversation))/i;
+        const ALLOW_ONE = /^(允許|允許一次|Allow|Allow once)$/i;
+        const DENY = /拒絕|不允許|Deny|Don.t allow|Reject|Decline/i;
+        const CHAT = /\/chat\/([0-9a-f-]{36})/;
+        const OWN = '.ccm-panel,.cho-dialog,.cho-toast,.cug-card';
+        const label = (b) => (b.innerText || b.textContent || '').trim();
+        function scan() {
+            const M = TOOLS.meter; if (!M || !M.opts().autoAllow) return;
+            const cm = location.pathname.match(CHAT); if (!cm) return;
+            for (const b of document.querySelectorAll('button')) {
+                if (b.disabled || b.closest(OWN) || !b.offsetParent) continue;
+                const t = label(b); if (!ALLOW_ALL.test(t) && !ALLOW_ONE.test(t)) continue;
+                let box = b.parentElement;
+                // 往上找最多 6 層、按鈕不超過 5 顆的容器：太大的容器（例如整頁）會把不相干的「允許」配到別處的「拒絕」
+                for (let i = 0; box && i < 6; i++, box = box.parentElement) { const bs = box.querySelectorAll('button'); if (bs.length > 5) { box = null; break; } if ([...bs].some((x) => x !== b && DENY.test(label(x)))) break; }
+                if (!box || box.dataset.cctDone) continue;
+                const btns = [...box.querySelectorAll('button')].filter((x) => !x.disabled && x.offsetParent);
+                const pick = btns.find((x) => ALLOW_ALL.test(label(x))) || btns.find((x) => ALLOW_ONE.test(label(x)));
+                if (!pick) continue;
+                box.dataset.cctDone = '1';
+                const what = ((box.innerText || '').split('\n').map((x) => x.trim()).find((x) => x && !btns.some((y) => label(y) === x)) || '').slice(0, 40);
+                pick.click();
+                const key = 'allowlog:' + cm[1], logs = M.load(key, []);
+                const d = new Date(), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+                logs.push({ time: hm, what: label(pick) + '：' + what }); M.save(key, logs.slice(-50));
+                console.log('[ClaudeChatTools] 自動允許：', label(pick), what);
+            }
+        }
+        let tm = null;
+        new MutationObserver(() => { if (tm) return; tm = setTimeout(() => { tm = null; try { scan(); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); } }, 300); }).observe(document.body, { childList: true, subtree: true });
     });
 })();

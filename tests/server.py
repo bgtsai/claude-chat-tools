@@ -4,6 +4,7 @@ ORG='11111111-2222-3333-4444-555555555555'
 MODE={'tree':'calib'}  # calib：有 /context 校正點；nocalib：沒有
 CTX='## Context Usage\n\n**Model:** x  \n**Tokens:** 404.4k / 1m (40%)\n\n| Category | Tokens | Percentage |\n|---|---|---|\n| Messages | 269.5k | 26.9% |\n'
 def tree(cid):
+    if MODE.get('custom'): return json.loads(MODE['custom'])
     msgs=[]
     def add(uuid,sender,content):
         msgs.append({"uuid":uuid,"parent_message_uuid":msgs[-1]["uuid"] if msgs else "00000000-0000-4000-8000-000000000000","sender":sender,"content":content,"attachments":[]})
@@ -26,10 +27,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def do_GET(self):
         p=self.path
-        if p.startswith('/mode/'):MODE['tree']=p[6:];self._s(b'ok','text/plain')
+        if p.startswith('/mode/'):MODE['tree']=p[6:];MODE['custom']=None;self._s(b'ok','text/plain')
         elif p.startswith('/chat/'):self._s(PAGE.encode(),'text/html')
         elif '/chat_conversations/' in p:self._s(json.dumps(tree(p)).encode(),'application/json')
         else:self._s(b'{}','application/json')
+    def do_POST(self):
+        n=int(self.headers.get('content-length',0)); MODE['custom']=self.rfile.read(n).decode() or None; self._s(b'ok','text/plain')
     def _s(self,b,ct):
         self.send_response(200);self.send_header('content-type',ct);self.send_header('content-length',str(len(b)));self.end_headers();self.wfile.write(b)
 class S(socketserver.ThreadingMixIn,http.server.HTTPServer):daemon_threads=True;allow_reuse_address=True
