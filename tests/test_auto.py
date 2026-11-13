@@ -76,6 +76,11 @@ with sync_playwright() as p:
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300);pg.click('.ccm-calib');pg.wait_for_timeout(3500);poke(pg);pg.wait_for_timeout(4000)
     s=sent(pg);chk('手動校正逾時照送',len(s)==2 and '校正失敗，用估算（手動校正）' in s[1],s);b.close()
+    # 一般自動校正（還沒校正過）後也補送（v0.3.1）
+    t1=T(('human','開始做'),('assistant','好'))
+    b,pg=page(p,name,t1)
+    s0=sent(pg);put(T(('human','開始做'),('assistant','好'),('human','/context'),('assistant',CTX('200k','80k'))));poke(pg)
+    s=sent(pg);chk('自動校正後補送',s0==['/context'] and len(s)==2 and s[1].startswith('〔自動〕已校正用量（自動校正）。') and '[ctx ' in s[1],s);b.close()
     # 面板
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300)

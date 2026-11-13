@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.3.0
+// @version      0.3.1
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -202,7 +202,9 @@
         if (!need) return;
         const ed = document.querySelector(SEL.input);
         if (!ed || ed.innerText.trim()) return; // 使用者有沒送出的字就不動，下一輪再說
-        if (await sendContext('自動 /context')) save('autoctx:' + cid, lastU);
+        const idx = calib ? calib.idx : -1;
+        // v0.3.1：一般自動校正也要補送（使用者回報 2026-11-13：只送 /context、沒把結果交給 Claude）
+        if (await sendContext('自動 /context')) { save('autoctx:' + cid, lastU); state.pendManual = { cid, idx, t: Date.now(), why: '自動校正' }; }
     }
     // 把一段文字填進輸入框並送出（/context、〔自動〕訊息共用）；輸入框有字時不送。成功回 true
     async function fillSend(text, who) {
@@ -302,7 +304,8 @@
             return true;
         }
         state.pendManual = null;
-        fillSend(AUTO_PREFIX + (got ? '已校正用量（手動校正）。' : '校正失敗，用估算（手動校正）。') + '\n' + tagText(), '校正補送');
+        const why = p.why || '手動校正';
+        fillSend(AUTO_PREFIX + (got ? '已校正用量（' + why + '）。' : '校正失敗，用估算（' + why + '）。') + '\n' + tagText(), '校正補送');
         return true;
     }
     function autoFlow(cid, trunk, calib) {
