@@ -81,6 +81,26 @@ with sync_playwright() as p:
     b,pg=page(p,name,t1)
     s0=sent(pg);put(T(('human','開始做'),('assistant','好'),('human','/context'),('assistant',CTX('200k','80k'))));poke(pg)
     s=sent(pg);chk('自動校正後補送',s0==['/context'] and len(s)==2 and s[1].startswith('〔自動〕已校正用量（自動校正）。') and '[ctx ' in s[1],s);b.close()
+    # 〔建議交接〕（v0.4.0）：只看自動交接開關；腳本不再用公式自己判斷
+    SUG='第②批好了。\n〔建議交接〕目前 50%，下一階段約 40 次工具呼叫，換新對話串約 12 次後回本。'
+    hi=lambda *x:T(('human','開始做'+'a'*350000),('human','/context'),('assistant',CTX('500k','350k')),*x)   # 50%：舊公式會判「建議換」
+    btn="document.querySelector('.cho-btn').textContent.trim()"
+    b,pg=page(p,name,hi(('assistant','好')))
+    chk('沒有〔建議交接〕不亮藍燈',pg.evaluate("!document.querySelector('.ccm-strip')||!document.querySelector('.ccm-strip').dataset.kind") and '建議換串' not in pg.inner_text('#ccm-badge'),pg.inner_text('#ccm-badge'));b.close()
+    b,pg=page(p,name,hi(('assistant',SUG)))
+    chk('開關關：只亮按鈕不代送',sent(pg)==[] and pg.evaluate(btn)=='建議交接' and '建議換串' in pg.inner_text('#ccm-badge') and pg.evaluate("document.querySelector('.ccm-strip').dataset.kind")=='blue',[sent(pg),pg.evaluate(btn)]);b.close()
+    b,pg=page(p,name,hi(('assistant',SUG)),opt={'autoHandoff':True})
+    s=sent(pg);poke(pg);s2=sent(pg)
+    chk('開關開：代送交接請求、只送一次',len(s)==1 and s[0].startswith('〔自動〕請歸檔、準備交接內容') and s2==s and pg.evaluate("[localStorage.getItem('ccm:await:%s'),localStorage.getItem('ccm:ahn')]"%CID)==['"suggest"','1'] and pg.evaluate(btn)=='交接準備中…',[s2,pg.evaluate(btn)]);b.close()
+    b,pg=page(p,name,hi(('assistant',SUG),('human','/context'),('assistant',CTX('510k','360k'))),opt={'autoHandoff':True})
+    chk('/context 輸出蓋不掉建議、但不會晚一則才觸發',sent(pg)==[] and '建議換串' in pg.inner_text('#ccm-badge'),sent(pg));b.close()
+    b,pg=page(p,name,hi(('assistant',SUG)),opt={'autoHandoff':True},pre="localStorage.setItem('ccm:ahn','5')")
+    chk('連續自動交接上限：不代送',sent(pg)==[] and pg.evaluate(btn)=='建議交接',sent(pg));b.close()
+    b,pg=page(p,name,hi(('assistant',SUG)),opt={'autoHandoff':True,'onStop':'archive'})
+    chk('停下來時不是歸檔交接：開關算關',sent(pg)==[],sent(pg));b.close()
+    op2='讀完 01 之後：接續 Y。'
+    b,pg=page(p,name,base(('assistant','寫好了。\n〔交接就緒〕開場白 %d 字\n```\n%s\n```'%(len(op2),op2))),pre="localStorage.setItem('ccm:await:%s','\"suggest\"')"%CID)
+    chk('suggest 請求後〔交接就緒〕接著開新串',pg.evaluate("!!document.querySelector('.cho-toast')&&document.querySelector('.cho-toast').innerText.includes('自動交接沒有執行')"));b.close()
     # 面板
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300)

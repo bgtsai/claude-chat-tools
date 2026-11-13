@@ -22,7 +22,7 @@ with sync_playwright() as p:
         pg.click('.ccm-meter'); pg.wait_for_timeout(200)
         g=pg.evaluate("(()=>{const a=document.querySelector('.ccm-meter').getBoundingClientRect(),p=document.querySelector('.ccm-panel');if(!p)return null;const r=p.getBoundingClientRect();return {dl:Math.round(r.left-a.left),gap:Math.round(r.top-a.bottom),txt:p.innerText}})()")
         check('點標籤開面板、左緣切齊',g and g['dl']==0 and g['gap']==8,str(g and {k:g[k] for k in ('dl','gap')}))
-        check('面板內容層次',g and '/ 100 萬' in g['txt'] and '後回本' in g['txt'] and ('建議換' in g['txt'] or '不用換' in g['txt']) and '固定部分 F' in g['txt'] and '校正' in g['txt'],(g or {}).get('txt','').replace('\n',' | '))
+        check('面板內容層次',g and '/ 100 萬' in g['txt'] and '後回本' in g['txt'] and 'Claude 的建議：建議換串' in g['txt'] and '下一階段約 30 次' in g['txt'] and '固定部分 F' in g['txt'] and '校正' in g['txt'],(g or {}).get('txt','').replace('\n',' | '))
         pg.screenshot(path=f'/tmp/ccm_ui_{name}_panel.png')
         pg.keyboard.press('Escape'); pg.wait_for_timeout(100)
         check('Esc 關面板',pg.query_selector('.ccm-panel') is None)

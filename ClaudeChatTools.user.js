@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.3.1
+// @version      0.4.0
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -36,7 +36,6 @@
         RULES_R: 42000,               // R：新對話串要讀的規則
         HANDOFF_H: 5000,              // H：交接內容
         WORK_W: 40000,                // W：新對話串要重讀的工作資料
-        NEXT_ROUNDS: 15,              // 下一階段預估輪數（沒有其他資訊時的預設）
         K_READ: 0.1, K_WRITE: 1.25,   // 快取讀取／寫入相對正常價的比例（01 第⑫條）
         WARN_PCT: 0.70,               // 開始提醒的用量（黃）
         HIGH_PCT: 0.80,               // 紅：再往上可能來不及歸檔＋交接就被自動壓縮（96.7 萬壓縮 − 歸檔交接約 15 萬，推測值，待實測）
@@ -48,8 +47,6 @@
         CONT_MAX: 15,                 // 連續自動續做上限（可能在空轉）
         CONT_NEAR_PCT: 0.05,          // 加上下一批後離門檻不到這麼多 → 先送 /context 校正再判斷
         CTX_WAIT_MS: 30000,           // 代送 /context 後等輸出的上限；逾時照估算判斷並照送
-        CALLS_PER_BATCH: 30,          // 沒有前幾批可平均時，每批的工具呼叫次數（估計值）
-        SWITCH_COST_FACTOR: 2.5,      // 換串成本＝公式 × 這個倍數（沒實測資料時；交接檔：約公式的 2～3 倍）
         AUTO_HANDOFF_MAX: 5,          // 連續自動交接上限；手動交接歸零（使用者定案）
         TAG_ON_SEND: true,            // 送出訊息時在尾端附用量標記，讓 Claude 每輪讀得到（使用者定案，2026-11-12）
         REFRESH_THROTTLE_MS: 1500,    // 同一輪結束常連續觸發好幾次，合併成一次（節流，不是防手震）
@@ -66,15 +63,15 @@
     };
 
     const state = { orgId: null, last: null, err: null, autoPending: false };
-    const SWITCH_FACTOR = () => { const h = load('hcost', null); return h && h.factor ? h.factor : CFG.SWITCH_COST_FACTOR; };
     const curCid = () => (location.pathname.match(CHAT_RE) || [])[1] || '';
     TOOLS.meter = { state, opts: () => opts(), save: (k, v) => save(k, v), load: (k, d) => load(k, d),
-        isWaiting: () => load('await:' + curCid(), 0) === 'manual',
+        isWaiting: () => { const a = load('await:' + curCid(), 0); return a === 'manual' || a === 'suggest'; },
         // 手動交接：代送請求，記下「等〔交接就緒〕」；成功回 true
-        requestHandoff: async () => {
+        // kind：manual＝使用者按交接鈕；suggest＝Claude 寫了〔建議交接〕、自動交接開著。兩者〔交接就緒〕後都接著開新串
+        requestHandoff: async (kind) => {
             const cid = curCid(); if (!cid) return false;
             const ok = await fillSend(AUTO_PREFIX + '請歸檔、準備交接內容，完成後用〔交接就緒〕格式附上開場白。\n' + tagText(), '交接請求');
-            if (ok) save('await:' + cid, 'manual');
+            if (ok) save('await:' + cid, kind || 'manual');
             return ok;
         } };
     window.__ccm = state; // 給除錯用（Claude in Chrome 讀得到）
@@ -167,13 +164,14 @@
         const B = fixed + CFG.RULES_R + CFG.HANDOFF_H + CFG.WORK_W;
         const nStar = C > B ? (CFG.K_WRITE * B) / (CFG.K_READ * (C - B)) : Infinity;
         const pct = C / win;
-        const switchWorth = CFG.NEXT_ROUNDS >= nStar;
+        // v0.4.0：要不要換串由 Claude 判斷（腳本不知道下一階段要做多少）；舊版用寫死的「下一階段 15 輪」≥ N*，約 42% 就亮，不準（使用者定案 2026-11-13）
+        const sug = suggestOf(trunk);
+        const switchWorth = !!sug;
 
         state.last = { cid, t: Date.now(), C: Math.round(C), pct, win, fixed: Math.round(fixed), k: +k.toFixed(3), estNow: Math.round(estNow), msgs: trunk.length,
             calib: calib ? { total: calib.total, messages: calib.messages, idx: calib.idx, ago: trunk.length - 1 - calib.idx } : null,
-            source: calib ? '此對話串的 /context' : (g ? '其他對話串的校正' : '預設值'), B: Math.round(B), nStar, switchWorth };
+            source: calib ? '此對話串的 /context' : (g ? '其他對話串的校正' : '預設值'), B: Math.round(B), nStar, switchWorth, suggest: sug ? sug.reason : '' };
         const ci = contInfo(trunk);
-        if (ci) { const calls = ci.left * callsPerBatch(trunk), ns = nStar * SWITCH_FACTOR(); state.last.cont = { left: ci.left, calls, nStar: ns, switchWorth: calls >= ns }; }
         state.last.autoN = autoCount(trunk);
         state.last.continuing = !!ci || (trunk.length && trunk[trunk.length - 1].sender === 'human' && textOf(trunk[trunk.length - 1]).trim().startsWith(AUTO_PREFIX + '繼續'));
         state.err = null;
@@ -241,6 +239,7 @@
     // 只是看用量，不是新的授權：Claude 只在使用者已同意的分批計畫裡寫〔續做〕。
     const CONT_RE = /^〔續做〕下一批：(.+?)；預估\s*([\d.]+)\s*萬；剩\s*(\d+)\s*批/;
     const READY_RE = /^〔交接就緒〕開場白\s*(\d+)\s*字\s*$/m;
+    const SUG_RE = /^〔建議交接〕(.*)$/;
     const AUTO_PREFIX = '〔自動〕';
     const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false };
     const opts = () => Object.assign({}, OPT_DEF, load('opt', {}));
@@ -257,16 +256,18 @@
         return -1;
     }
     const autoCount = trunk => trunk.slice(lastUserIdx(trunk) + 1).filter(m => m.sender === 'human' && textOf(m).trim().startsWith(AUTO_PREFIX + '繼續')).length;
-    // 一批＝兩則 human 之間所有助理訊息的工具呼叫；只算以〔續做〕結尾的批，取平均（一輪＝重讀一次上下文）
-    function callsPerBatch(trunk) {
-        const batches = []; let n = 0, lastTxt = '';
-        for (const m of trunk) {
-            if (m.sender === 'human') { if (CONT_RE.test(lastLine(lastTxt))) batches.push(n); n = 0; lastTxt = ''; continue; }
-            n += (m.content || []).filter(b => b.type === 'tool_use').length; const t = textOf(m); if (t.trim()) lastTxt = t;
+    // 最近一則 Claude 回覆（跳過 /context 的輸出：腳本常在回覆後代送 /context，輸出也是 assistant，會把建議蓋掉）的最後一行是〔建議交接〕
+    function suggestOf(trunk) {
+        for (let i = trunk.length - 1; i >= 0; i--) {
+            const m = trunk[i]; if (m.sender !== 'assistant') continue;
+            const t = textOf(m); if (!t.trim() || t.startsWith(CTX_HEAD)) continue;
+            const sm = lastLine(t).match(SUG_RE);
+            return sm ? { uuid: m.uuid, idx: i, reason: sm[1].trim() } : null;
         }
-        const recent = batches.slice(-3);
-        return recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : CFG.CALLS_PER_BATCH;
+        return null;
     }
+    // 自動交接開關的實際狀態（跟面板顯示一致：「停下來時」不是歸檔交接、或門檻 85% 時算關）
+    const autoHandoffOn = o => o.autoHandoff && effOnStop(o) === 'handoff';
     function contInfo(trunk) {
         const last = trunk[trunk.length - 1];
         if (!last || last.sender !== 'assistant') return null;
@@ -282,15 +283,14 @@
         save('cont:' + cid, info.uuid);
         const L = state.last, o = opts(), n = autoCount(trunk);
         const after = L.pct + info.est / L.win;
-        const c = L.cont || {};
         let stop = null, kind = '';
+        // 建議換串不在這裡判斷：Claude 判斷划算時直接寫〔建議交接〕代替〔續做〕（v0.4.0）
         if (after >= o.thr) { kind = 'thr'; stop = '現在 ' + P(L.pct) + '%，加上下一批約 ' + P(after) + '%，超過門檻 ' + P(o.thr) + '%。'; }
-        else if (c.switchWorth) { kind = 'switch'; stop = '建議換串。剩 ' + info.left + ' 批約 ' + Math.round(c.calls) + ' 次工具呼叫，換新對話串約 ' + Math.ceil(c.nStar) + ' 次後回本。'; }
         else if (n >= CFG.CONT_MAX) { kind = 'max'; stop = '已經連續自動續做 ' + CFG.CONT_MAX + ' 次，可能在空轉。'; }
         const tail = note ? note : '';
         const msg = stop ? AUTO_PREFIX + '停：' + stop + tail + '\n' + stopLine2(kind) : AUTO_PREFIX + '繼續（第 ' + (n + 1) + ' 次）。' + tail;
         const ok = await fillSend(msg + '\n' + tagText(), '自動續做');
-        if (ok && stop && kind !== 'max' && effOnStop(o) === 'handoff' && o.autoHandoff) save('await:' + cid, 1);
+        if (ok && stop && kind !== 'max' && autoHandoffOn(o)) save('await:' + cid, 1);
         state.contLog = { t: Date.now(), msg: msg.split('\n')[0], ok };
     }
     // 回傳 true＝這一輪由續做流程處理（含要不要送 /context），一般的自動 /context 不再插手
@@ -319,6 +319,7 @@
         }
         const last = trunk[trunk.length - 1];
         if (last && last.sender === 'assistant') { const t = textOf(last), rm = t.match(READY_RE); if (rm) { handleReady(cid, last, t, rm); return true; } }
+        if (handleSuggest(cid, trunk)) return true;
         const info = contInfo(trunk);
         if (!info) return false;
         if (load('cont:' + cid, '') === info.uuid) return true; // 同一則回覆只回一次
@@ -338,7 +339,21 @@
         return true;
     }
 
-    // ── 4c. 自動交接：讀〔交接就緒〕下面的程式碼區塊（不經剪貼簿）──
+    // ── 4c. Claude 寫〔建議交接〕：自動交接開著 → 代送交接請求；關著 → 只亮標籤、藍燈、交接鈕「建議交接」（使用者定案 2026-11-13：只看開關，不看使用者在不在）──
+    // 自動觸發也算進連續自動交接上限，避免 Claude 判斷錯誤時一直換串；同一則回覆只觸發一次
+    function handleSuggest(cid, trunk) {
+        const last = trunk[trunk.length - 1], sg = suggestOf(trunk);
+        if (!sg || !last || last.uuid !== sg.uuid) return false;     // 只在 Claude 剛寫完這則時觸發
+        const o = opts(), n = load('ahn', 0);
+        if (!autoHandoffOn(o) || n >= CFG.AUTO_HANDOFF_MAX) return false;
+        if (load('sug:' + cid, '') === sg.uuid || load('await:' + cid, 0)) return true;
+        const ed = document.querySelector(SEL.input);
+        if (!ed || ed.innerText.trim()) return true;                  // 使用者在打字：不動
+        TOOLS.meter.requestHandoff('suggest').then(ok => { if (ok) { save('sug:' + cid, sg.uuid); save('ahn', n + 1); } });
+        return true;
+    }
+
+    // ── 4d. 自動交接：讀〔交接就緒〕下面的程式碼區塊（不經剪貼簿）──
     function handleReady(cid, last, txt, rm) {
         if (load('ready:' + cid, '') === last.uuid) return;
         const N = +rm[1];
@@ -352,7 +367,7 @@
         state.handoffText = bm[1];
         const o = opts(), n = load('ahn', 0);
         const aw = load('await:' + cid, 0);
-        if (aw === 'manual' && TOOLS.handover) { save('await:' + cid, 0); TOOLS.handover.run(bm[1], { auto: true }); }
+        if ((aw === 'manual' || aw === 'suggest') && TOOLS.handover) { save('await:' + cid, 0); TOOLS.handover.run(bm[1], { auto: true }); }
         else if (aw && o.autoHandoff && n < CFG.AUTO_HANDOFF_MAX && TOOLS.handover) {
             save('ahn', n + 1); save('await:' + cid, 0);
             TOOLS.handover.run(bm[1], { auto: true });
@@ -437,9 +452,10 @@
         if (L) {
             parts.push(row(man(L.C) + ' / ' + man(L.win) + '（' + Math.round(L.pct * 100) + '%）', 'font-weight:600'));
             const j = document.createElement('div'); j.style.marginTop = '8px';
-            j.append('換新對話串約 ', Object.assign(document.createElement('b'), { textContent: (isFinite(L.nStar) ? Math.ceil(L.nStar) : '—') + ' 輪' }),
-                '後回本，下一階段預估 ' + CFG.NEXT_ROUNDS + ' 輪', document.createElement('br'),
-                Object.assign(document.createElement('b'), { textContent: L.switchWorth ? '建議換' : '不用換' }));
+            // v0.4.0：結論由 Claude 判斷（〔建議交接〕那一行）；回本輪數只是公式估計，留著當參考
+            j.append('Claude 的建議：', Object.assign(document.createElement('b'), { textContent: L.switchWorth ? '建議換串' : '沒有建議' }));
+            if (L.suggest) j.append(document.createElement('br'), L.suggest);
+            j.append(document.createElement('br'), '換新對話串約 ' + (isFinite(L.nStar) ? Math.ceil(L.nStar) : '—') + ' 輪後回本（公式估計）');
             parts.push(j);
             const basis = row('', 'margin-top:8px;padding-top:8px;border-top:1px solid ' + line + ';color:' + dim);
             basis.append('校正：' + L.source + (L.calib ? '（' + L.calib.ago + ' 則訊息前）' : ''), document.createElement('br'),
@@ -513,7 +529,7 @@
         s1.append(head('自動續做', L.continuing ? '續做中・已自動 ' + (L.autoN || 0) + ' 次（上限 ' + CFG.CONT_MAX + '）' : '沒有在續做'));
         s1.append(div('margin-top:10px', '停止門檻'), small('加上下一批的預估後超過就停；紅燈也照這條線'));
         const t = div('margin-top:8px'); t.append(seg(d, [[0.70, '70%'], [0.75, '75%'], [0.80, '80%'], [0.85, '85%']], o.thr, v => setOpt('thr', v))); s1.append(t);
-        s1.append(div('margin-top:14px', '停下來時'), small('到門檻、建議換串、連續自動 ' + CFG.CONT_MAX + ' 次都會停'));
+        s1.append(div('margin-top:14px', '停下來時'), small('到門檻、連續自動 ' + CFG.CONT_MAX + ' 次都會停'));
         const hi = o.thr >= 0.85;
         const u = div('margin-top:8px'); u.append(seg(d, [['draft', '只記草稿'], ['archive', '先歸檔'], ['handoff', '歸檔交接']], effOnStop(o), v => setOpt('onStop', v), hi ? ['archive', 'handoff'] : null)); s1.append(u);
         if (hi) s1.append(Object.assign(small('門檻 85% 時剩下的空間來不及歸檔，只能只記草稿', warnC), { style: 'margin-top:6px;font-size:13px;line-height:18px;color:' + warnC }));
@@ -1443,16 +1459,17 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
   resumeRestore();
 
   // 測試用的進入點（不影響正常使用）
-  // 交接鈕的三種樣子（mockup 8 區）：平常／收到〔交接就緒〕但自動交接關著 →「可以交接了」（藍）／執行中 →「交接中…」
+  // 交接鈕的樣子（mockup 8 區）：平常／收到〔交接就緒〕但自動交接關著 →「可以交接了」（藍）／Claude 寫了〔建議交接〕→「建議交接」（藍）／執行中 →「交接中…」
   function refreshLabel() {
     const b = document.querySelector('.cho-btn'); if (!b) return;
     const M = TOOLS.meter, ready = !!(M && M.state.handoffText);
     const waiting = !!(M && M.isWaiting());
-    const label = running ? '交接中…' : ready ? '可以交接了' : waiting ? '交接準備中…' : '交接對話串';
+    const sug = !!(M && M.state.last && M.state.last.switchWorth); // Claude 寫了〔建議交接〕（v0.4.0）
+    const label = running ? '交接中…' : ready ? '可以交接了' : waiting ? '交接準備中…' : sug ? '建議交接' : '交接對話串';
     const spans = [...b.querySelectorAll('span')].filter((x) => !x.children.length && x.textContent.trim());
     const tgt = spans.length ? spans[spans.length - 1] : b;
     if (tgt.textContent !== label) tgt.textContent = label;
-    const want = ready && !running ? '1' : '';
+    const want = (ready || (sug && !waiting)) && !running ? '1' : '';
     if ((b.dataset.ready || '') !== want) {
       b.dataset.ready = want;
       if (want) { b.style.background = '#2c84db'; b.style.color = '#ffffff'; b.style.border = '1px solid #2c84db'; }

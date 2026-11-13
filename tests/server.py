@@ -9,8 +9,10 @@ def tree(cid):
     def add(uuid,sender,content):
         msgs.append({"uuid":uuid,"parent_message_uuid":msgs[-1]["uuid"] if msgs else "00000000-0000-4000-8000-000000000000","sender":sender,"content":content,"attachments":[]})
     add('m1','human',[{"type":"text","text":"a"*35000}])          # 35000/3.5 = 10000
-    add('m2','assistant',[{"type":"text","text":"中"*5000}])       # 5000
-    if MODE['tree'] in ('calib','y','r'):   # y：74% 黃、r：85% 紅；固定部分約 14 萬，讓「建議換串」也成立，才驗得到優先序 紅＞黃＞藍
+    # v0.4.0：「建議換串」來自 Claude 回覆最後一行的〔建議交接〕；calib／y／r 都帶，才驗得到藍燈與優先序 紅＞黃＞藍
+    sug='\n〔建議交接〕目前 40%，下一階段約 30 次工具呼叫，換新對話串約 12 次後回本。' if MODE['tree'] in ('calib','y','r') else ''
+    add('m2','assistant',[{"type":"text","text":"中"*5000+sug}])       # 5000
+    if MODE['tree'] in ('calib','y','r'):   # y：74% 黃、r：85% 紅
         ctx={'calib':CTX,'y':CTX.replace('404.4k','740k').replace('269.5k','600k'),'r':CTX.replace('404.4k','850k').replace('269.5k','710k')}[MODE['tree']]
         add('m3','human',[{"type":"text","text":"/context"}])
         add('m4','assistant',[{"type":"text","text":ctx}])

@@ -15,7 +15,7 @@ with sync_playwright() as p:
   for name in ['chromium','firefox']:
     a=run(p,name,'calib'); L=a['last']
     # 校正點之前：10000+5000+/context(8/3.5)=15002.3；之後新增 m4(輸出)+m5
-    ok1=L and L['calib'] and L['calib']['total']==404400 and abs(L['fixed']-134900)<1 and abs(L['k']-269500/15002.29)<0.01
+    ok1=L and L['calib'] and L['calib']['total']==404400 and abs(L['fixed']-134900)<1 and abs(L['k']-269500/(15002.29+34.71))<0.01   # v0.4.0：m2 尾端多了〔建議交接〕那一行（server.py 的 sug）
     ok2=L and 404400 < L['C'] < 404400+19*3000      # 只加上之後的部分，不含分支外的 99999 字
     import re as _re
     ok3=bool(a['badge'] and _re.fullmatch(r'4\d%(・建議換串)?',a['badge']))   # 只顯示百分比
