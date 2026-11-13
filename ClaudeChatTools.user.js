@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.4.0
+// @version      0.5.0
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.3.0';
+    const TOOLS_VERSION = '0.5.0';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -42,8 +42,10 @@
         WARN_STEP: 0.10,              // 之後每增加多少再提醒一次
         AUTO_CTX: true,               // 自動送 /context 校正
         AUTO_FIRST_MIN_MSGS: 2,       // 沒有校正點時，至少幾則訊息才送
-        AUTO_RECHECK_PCT: 0.65,       // 估算到這個用量、且上次校正低於 AUTO_RECHECK_BELOW 時再送一次
-        AUTO_RECHECK_BELOW: 0.60,
+        AUTO_RECHECK_STEP: 0.10,      // 估算比上次校正多出這麼多就再送一次 /context（v0.5.0；取代「65% 且上次 < 60%」）
+        COMPACT_K_BELOW: 0.7,         // 校正點的 k（訊息 ÷ 之前的估算）低於這個 → 視為壓縮過（壓縮後實測 0.28，平常約 1.8）
+        COMPACT_DROP: 0.7,            // 或訊息量少於上一次校正的這個比例 → 視為壓縮過（同方格圖的 30%）
+        SLOPE_MIN_EST: 20000,         // 用兩次校正的差算 k 時，中間的估算至少要多這麼多
         CONT_MAX: 15,                 // 連續自動續做上限（可能在空轉）
         CONT_NEAR_PCT: 0.05,          // 加上下一批後離門檻不到這麼多 → 先送 /context 校正再判斷
         CTX_WAIT_MS: 30000,           // 代送 /context 後等輸出的上限；逾時照估算判斷並照送
@@ -134,6 +136,27 @@
         return total && win && messages ? { total, win, messages } : null;
     }
 
+    // 之後新增訊息要乘的 k（v0.5.0）。壓縮會讓「訊息 ÷ 之前的估算」變得很小（2026-11-14 實測 0.28，平常約 1.8），
+    // 拿它乘之後的成長會嚴重低估、70% 提醒變晚。偵測到壓縮就改用：壓縮後兩次校正的差 → 壓縮前的校正 → 其他對話串的校正 → 預設值
+    // trusted：k 是量出來的（不是借來的），才可以存成其他對話串的參考
+    function growthK(cals, g) {
+        if (!cals.length) return { k: g && g.k ? g.k : CFG.DEFAULT_K, src: '', compacted: false, trusted: false };
+        // 壓縮點：訊息量比上一次校正掉很多，或 k 從正常掉到偏低。壓縮後 k 會偏低好一陣子，「一直偏低」不算新的壓縮
+        const low = c => c.k < CFG.COMPACT_K_BELOW;
+        const cut = cals.map((c, i) => i === 0 ? low(c) : (c.messages < cals[i - 1].messages * CFG.COMPACT_DROP || (low(c) && !low(cals[i - 1]))));
+        const s = cut.lastIndexOf(true), n = cals.length - 1, last = cals[n];
+        if (s < 0) return { k: last.k, src: '此串校正', compacted: false, trusted: true };
+        if (n > s) {
+            const a = cals[s], dEst = last.before - a.before, dMsg = last.messages - a.messages;
+            if (dEst >= CFG.SLOPE_MIN_EST && dMsg > 0) return { k: dMsg / dEst, src: '壓縮後兩次校正的差', compacted: true, trusted: true };
+        }
+        for (let j = s - 1; j >= 0; j--) {
+            if (cut.slice(0, j + 1).lastIndexOf(true) < 0) return { k: cals[j].k, src: '壓縮前的校正', compacted: true, trusted: false };
+        }
+        if (g && g.k && g.k >= CFG.COMPACT_K_BELOW) return { k: g.k, src: '其他對話串的校正', compacted: true, trusted: false };
+        return { k: CFG.DEFAULT_K, src: '預設值', compacted: true, trusted: false };
+    }
+
     async function refresh() {
         const cm = location.pathname.match(CHAT_RE);
         if (!cm || !state.orgId) return;
@@ -144,22 +167,28 @@
         const per = trunk.map(msgTokens);
         const estNow = per.reduce((a, b) => a + b, 0);
 
-        // 最近一次 /context
-        let calib = null;
-        for (let i = trunk.length - 1; i >= 0 && !calib; i--) {
+        // 這串所有的 /context（依序）
+        const cals = [];
+        let acc = 0;
+        for (let i = 0; i < trunk.length; i++) {
             const txt = (trunk[i].content || []).filter(b => b.type === 'text').map(b => b.text || '').join('\n');
             if (txt.startsWith(CTX_HEAD)) {
                 const p = parseContext(txt);
-                if (p) { const before = per.slice(0, i).reduce((a, b) => a + b, 0); calib = { ...p, idx: i, before, k: before > 0 ? p.messages / before : CFG.DEFAULT_K, fixed: p.total - p.messages }; }
+                if (p) cals.push({ ...p, idx: i, before: acc, k: acc > 0 ? p.messages / acc : CFG.DEFAULT_K, fixed: p.total - p.messages });
             }
+            acc += per[i];
         }
-        if (calib) save('lastCalib', { fixed: calib.fixed, k: calib.k, win: calib.win, at: Date.now() });
+        const calib = cals.length ? cals[cals.length - 1] : null;
         const g = load('lastCalib', null);
+        const kc = growthK(cals, g);
+        // 借來的 k 不存：其他對話串只能拿到量出來的 k（沒有量過就不寫 k，讀的人用預設值）
+        if (calib) save('lastCalib', kc.trusted ? { fixed: calib.fixed, k: kc.k, win: calib.win, at: Date.now() } : { ...(g || {}), fixed: calib.fixed, win: calib.win, at: Date.now() });
         const fixed = calib ? calib.fixed : (g ? g.fixed : CFG.DEFAULT_FIXED);
-        const k = calib ? calib.k : (g ? g.k : CFG.DEFAULT_K);
+        const k = calib ? kc.k : (g && g.k ? g.k : CFG.DEFAULT_K);
         const win = calib ? calib.win : (g ? g.win : CFG.DEFAULT_WINDOW);
-        // 有校正點時等同「/context 總量 ＋ k ×（之後新增的估算）」：k × 校正點之前的估算 ＝ 訊息，代數上相同
-        const C = fixed + k * estNow;
+        // 有校正點：從最近一次 /context 的總量起算，只加之後新增的估算 × k（v0.5.0）。
+        // 沒有壓縮過時跟舊算法（F ＋ k × 全部估算）代數上相同；壓縮過時舊算法會把壓縮前的訊息全算進去
+        const C = calib ? calib.total + k * (estNow - calib.before) : fixed + k * estNow;
 
         const B = fixed + CFG.RULES_R + CFG.HANDOFF_H + CFG.WORK_W;
         const nStar = C > B ? (CFG.K_WRITE * B) / (CFG.K_READ * (C - B)) : Infinity;
@@ -170,6 +199,7 @@
 
         state.last = { cid, t: Date.now(), C: Math.round(C), pct, win, fixed: Math.round(fixed), k: +k.toFixed(3), estNow: Math.round(estNow), msgs: trunk.length,
             calib: calib ? { total: calib.total, messages: calib.messages, idx: calib.idx, ago: trunk.length - 1 - calib.idx } : null,
+            compacted: kc.compacted, kSrc: calib ? kc.src : '',
             source: calib ? '此對話串的 /context' : (g ? '其他對話串的校正' : '預設值'), B: Math.round(B), nStar, switchWorth, suggest: sug ? sug.reason : '' };
         const ci = contInfo(trunk);
         state.last.autoN = autoCount(trunk);
@@ -196,7 +226,7 @@
         const nMsgs = trunk.length, lastU = trunk.length ? trunk[trunk.length - 1].uuid : '';
         if (load('autoctx:' + cid, '') === lastU) return;
         const need = (!calib && nMsgs >= CFG.AUTO_FIRST_MIN_MSGS)
-            || (calib && pct >= CFG.AUTO_RECHECK_PCT && calib.total / calib.win < CFG.AUTO_RECHECK_BELOW);
+            || (calib && pct - calib.total / calib.win >= CFG.AUTO_RECHECK_STEP);
         if (!need) return;
         const ed = document.querySelector(SEL.input);
         if (!ed || ed.innerText.trim()) return; // 使用者有沒送出的字就不動，下一輪再說
@@ -240,6 +270,7 @@
     const CONT_RE = /^〔續做〕下一批：(.+?)；預估\s*([\d.]+)\s*萬；剩\s*(\d+)\s*批/;
     const READY_RE = /^〔交接就緒〕開場白\s*(\d+)\s*字\s*$/m;
     const SUG_RE = /^〔建議交接〕(.*)$/;
+    const MEASURE_RE = /^〔量用量〕/;   // v0.5.0：Claude 要準確用量時寫這行，腳本送 /context 再補送〔自動〕已校正用量（Claude 要求）
     const AUTO_PREFIX = '〔自動〕';
     const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false };
     const opts = () => Object.assign({}, OPT_DEF, load('opt', {}));
@@ -308,6 +339,18 @@
         fillSend(AUTO_PREFIX + (got ? '已校正用量（' + why + '）。' : '校正失敗，用估算（' + why + '）。') + '\n' + tagText(), '校正補送');
         return true;
     }
+    // 最後一則 Claude 回覆的最後一行是〔量用量〕：送 /context，輸出出現後由 manualFollow 補送（同手動〔校正〕）；同一則只送一次
+    function handleMeasure(cid, trunk) {
+        const last = trunk[trunk.length - 1];
+        if (!last || last.sender !== 'assistant' || !MEASURE_RE.test(lastLine(textOf(last)))) return false;
+        if (load('meas:' + cid, '') === last.uuid) return true;
+        const ed = document.querySelector(SEL.input);
+        if (!ed || ed.innerText.trim()) return true;           // 使用者在打字：不動
+        save('meas:' + cid, last.uuid);
+        const idx = state.last && state.last.calib ? state.last.calib.idx : -1;
+        sendContext('Claude 要求').then(ok => { if (ok) state.pendManual = { cid, idx, t: Date.now(), why: 'Claude 要求' }; });
+        return true;
+    }
     function autoFlow(cid, trunk, calib) {
         if (manualFollow(cid, calib)) return true;
         if (state.pendCont && state.pendCont.cid === cid) {
@@ -320,6 +363,7 @@
         const last = trunk[trunk.length - 1];
         if (last && last.sender === 'assistant') { const t = textOf(last), rm = t.match(READY_RE); if (rm) { handleReady(cid, last, t, rm); return true; } }
         if (handleSuggest(cid, trunk)) return true;
+        if (handleMeasure(cid, trunk)) return true;
         const info = contInfo(trunk);
         if (!info) return false;
         if (load('cont:' + cid, '') === info.uuid) return true; // 同一則回覆只回一次
@@ -328,8 +372,9 @@
         const L = state.last, o = opts();
         const near = L.pct + info.est / L.win >= o.thr - CFG.CONT_NEAR_PCT;
         const fresh = calib && calib.idx > lastUserIdx(trunk);
-        // 離門檻近、或這串還沒有任何校正（新串量起點）→ 先代送 /context，輸出出現後一定補送〔自動〕訊息（mockup 9 區）
-        if ((near || !calib) && !fresh && load('autoctx:' + cid, '') !== info.uuid) {
+        const stale = calib && L.pct - calib.total / calib.win >= CFG.AUTO_RECHECK_STEP; // v0.5.0：上次校正後漲超過一步
+        // 離門檻近、這串還沒有任何校正（新串量起點）、或上次校正太舊 → 先代送 /context，輸出出現後一定補送〔自動〕訊息（mockup 9 區）
+        if ((near || !calib || stale) && !fresh && load('autoctx:' + cid, '') !== info.uuid) {
             save('autoctx:' + cid, info.uuid);
             state.pendCont = { cid, t: Date.now(), info };
             sendContext('續做校正').then(ok => { if (!ok && state.pendCont) { state.pendCont = null; decide(cid, trunk, info, '（校正失敗，用估算）'); } });
@@ -459,7 +504,7 @@
             parts.push(j);
             const basis = row('', 'margin-top:8px;padding-top:8px;border-top:1px solid ' + line + ';color:' + dim);
             basis.append('校正：' + L.source + (L.calib ? '（' + L.calib.ago + ' 則訊息前）' : ''), document.createElement('br'),
-                '固定部分 F ' + man(L.fixed) + '・係數 k ' + L.k + '・v' + VERSION);
+                '固定部分 F ' + man(L.fixed) + '・係數 k ' + L.k + (L.compacted ? '（壓縮過，k 用' + L.kSrc + '）' : '') + '・v' + VERSION);
             parts.push(basis);
         } else parts.push(row(state.err ? '⚠ ' + state.err : '還沒有資料', 'color:' + dim));
         if (L && state.err) parts.push(row('⚠ ' + state.err, 'margin-top:6px;color:' + (d ? '#ffd37a' : '#9a5b00')));
