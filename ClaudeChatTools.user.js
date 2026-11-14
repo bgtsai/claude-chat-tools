@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.5.1
+// @version      0.5.2
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.5.1';
+    const TOOLS_VERSION = '0.5.2';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -1541,32 +1541,53 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
     // 只按 claude.ai 畫面上「允許／拒絕」成對出現的那組按鈕；有「一律允許」類的優先按它（使用者：允許一次要反覆按、拖慢速度）。
     // 選擇器還沒看過真實畫面（使用者尚未截圖），所以用文字比對＋旁邊要有「拒絕」類按鈕，避免按到別的「允許」。
     whenReady(function () {
-        const ALLOW_ALL = /^(一律允許|永遠允許|總是允許|全部允許|允許全部|始終允許|Always allow|Allow always|Allow all|Allow for this (chat|session|conversation))/i;
-        const ALLOW_ONE = /^(允許|允許一次|Allow|Allow once)$/i;
+        const ALLOW_ALL = /^(一律允許此網站|一律允許|永遠允許|總是允許|全部允許|允許全部|始終允許|Always allow|Allow always|Allow all|Allow for this (chat|session|conversation))/i;
+        const ALLOW_ONE = /^(允許|允許一次|Allow|Allow once)$/i;   // 比對 label() 的第一行
         const DENY = /拒絕|不允許|Deny|Don.t allow|Reject|Decline/i;
-        const CHAT = /\/chat\/([0-9a-f-]{36})/;
+        const CHAT = /\/(?:chat|code)\/([\w-]{20,})/;
         const OWN = '.ccm-panel,.cho-dialog,.cho-toast,.cug-card';
-        const label = (b) => (b.innerText || b.textContent || '').trim();
+        // 按鈕文字後面接著快捷鍵提示（「允許一次\nCtrl\n回车键 (⏎)\nEnter」），只取第一行
+        const label = (b) => ((b.innerText || b.textContent || '').trim().split('\n')[0] || '').trim();
+        // 授權卡可能是固定定位：offsetParent 會是 null，改用 getClientRects
+        const shown = (b) => b && !b.disabled && b.getClientRects().length > 0;
+        const DENY_SEL = 'button[aria-keyshortcuts="Escape"]';
+        function done(box, pick, cm, M) {
+            box.dataset.cctDone = '1';
+            let up = box, what = '';
+            // 往上找到第一段「不是按鈕」的文字（授權卡的說明，例如要讀哪個網站）
+            for (let i = 0; up && i < 6 && !what; i++, up = up.parentElement) {
+                const c = up.cloneNode(true); c.querySelectorAll('button').forEach(x => x.remove());
+                what = (c.textContent || '').replace(/\s+/g, ' ').trim();
+            }
+            pick.click();
+            const key = 'allowlog:' + cm[1], logs = M.load(key, []);
+            const d = new Date(), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+            logs.push({ time: hm, what: label(pick) + '：' + what.slice(0, 40) }); M.save(key, logs.slice(-50));
+            console.log('[ClaudeChatTools] 自動允許：', label(pick), what);
+        }
         function scan() {
             const M = TOOLS.meter; if (!M || !M.opts().autoAllow) return;
             const cm = location.pathname.match(CHAT); if (!cm) return;
+            // v0.5.2：照真實授權卡（2026-11-14 錄到）用屬性找：[data-approval-allow] 裡有「一律允許此網站」（含 [data-approval-lasting]）與「允許一次」（button[data-approval-primary]），旁邊的拒絕鈕 aria-keyshortcuts=Escape
+            for (const g of document.querySelectorAll('[data-approval-allow]')) {
+                if (g.closest(OWN)) continue;
+                let box = g; for (let i = 0; box && i < 3 && !box.querySelector(DENY_SEL); i++) box = box.parentElement;
+                if (!box || !box.querySelector(DENY_SEL) || box.dataset.cctDone) continue;
+                const lasting = (box.querySelector('[data-approval-lasting]') || {}).closest?.('button');
+                const pick = [lasting, box.querySelector('button[data-approval-primary]')].find(shown);
+                if (pick) done(box, pick, cm, M);
+            }
+            // 備援：舊的文字比對（屬性改名時）
             for (const b of document.querySelectorAll('button')) {
-                if (b.disabled || b.closest(OWN) || !b.offsetParent) continue;
+                if (!shown(b) || b.closest(OWN) || b.closest('[data-approval-allow]')) continue;
                 const t = label(b); if (!ALLOW_ALL.test(t) && !ALLOW_ONE.test(t)) continue;
                 let box = b.parentElement;
                 // 往上找最多 6 層、按鈕不超過 5 顆的容器：太大的容器（例如整頁）會把不相干的「允許」配到別處的「拒絕」
                 for (let i = 0; box && i < 6; i++, box = box.parentElement) { const bs = box.querySelectorAll('button'); if (bs.length > 5) { box = null; break; } if ([...bs].some((x) => x !== b && DENY.test(label(x)))) break; }
                 if (!box || box.dataset.cctDone) continue;
-                const btns = [...box.querySelectorAll('button')].filter((x) => !x.disabled && x.offsetParent);
+                const btns = [...box.querySelectorAll('button')].filter(shown);
                 const pick = btns.find((x) => ALLOW_ALL.test(label(x))) || btns.find((x) => ALLOW_ONE.test(label(x)));
-                if (!pick) continue;
-                box.dataset.cctDone = '1';
-                const what = ((box.innerText || '').split('\n').map((x) => x.trim()).find((x) => x && !btns.some((y) => label(y) === x)) || '').slice(0, 40);
-                pick.click();
-                const key = 'allowlog:' + cm[1], logs = M.load(key, []);
-                const d = new Date(), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-                logs.push({ time: hm, what: label(pick) + '：' + what }); M.save(key, logs.slice(-50));
-                console.log('[ClaudeChatTools] 自動允許：', label(pick), what);
+                if (pick) done(box, pick, cm, M);
             }
         }
         // v0.5.1 錄製：不限 /chat/ 網址（Claude Code 的對話是 /code/session_…，scan() 的 CHAT 比對會直接跳過——疑似沒按到的原因）
