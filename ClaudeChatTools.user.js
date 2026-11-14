@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.5.2
+// @version      0.5.3
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.5.2';
+    const TOOLS_VERSION = '0.5.3';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -1551,7 +1551,27 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
         // 授權卡可能是固定定位：offsetParent 會是 null，改用 getClientRects
         const shown = (b) => b && !b.disabled && b.getClientRects().length > 0;
         const DENY_SEL = 'button[aria-keyshortcuts="Escape"]';
-        function done(box, pick, cm, M) {
+        // v0.5.3：實機上 pick.click() 被 claude.ai 忽略（2026-11-14：腳本按了兩次「一律允許此網站」，請求照樣逾時）。
+        // 依序試：完整滑鼠事件 → 焦點＋快捷鍵（卡片上標的 Ctrl(+Shift)+Enter）；每種等 0.6 秒看卡片有沒有消失。都沒效就記「代按失敗」、不再重試這張卡。
+        const gone = (box, pick) => !box.isConnected || !pick.isConnected || !shown(pick);
+        const wait = (ms) => new Promise(r => setTimeout(r, ms));
+        function mouse(b) {
+            const r = b.getBoundingClientRect(), o = { bubbles: true, cancelable: true, composed: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
+            const P = window.PointerEvent || MouseEvent, pd = { ...o, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+            b.dispatchEvent(new P('pointerover', pd)); b.dispatchEvent(new P('pointerenter', pd));
+            b.dispatchEvent(new P('pointerdown', { ...pd, buttons: 1 })); b.dispatchEvent(new MouseEvent('mousedown', { ...o, buttons: 1 }));
+            b.focus && b.focus();
+            b.dispatchEvent(new P('pointerup', pd)); b.dispatchEvent(new MouseEvent('mouseup', o));
+            b.dispatchEvent(new MouseEvent('click', o));
+        }
+        function keys(b) {
+            const ks = (b.getAttribute('aria-keyshortcuts') || 'Control+Enter').split('+');
+            const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true, ctrlKey: ks.includes('Control'), shiftKey: ks.includes('Shift'), altKey: ks.includes('Alt'), metaKey: ks.includes('Meta') };
+            b.focus && b.focus();
+            const t = document.activeElement || document;   // 只送一次：會冒泡到 document，兩邊都送會觸發兩次（可能按到下一張卡）
+            t.dispatchEvent(new KeyboardEvent('keydown', o)); t.dispatchEvent(new KeyboardEvent('keyup', o));
+        }
+        async function done(box, pick, cm, M) {
             box.dataset.cctDone = '1';
             let up = box, what = '';
             // 往上找到第一段「不是按鈕」的文字（授權卡的說明，例如要讀哪個網站）
@@ -1559,11 +1579,17 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
                 const c = up.cloneNode(true); c.querySelectorAll('button').forEach(x => x.remove());
                 what = (c.textContent || '').replace(/\s+/g, ' ').trim();
             }
-            pick.click();
+            const name = label(pick);
+            let how = '';
+            for (const [k, fn] of [['滑鼠', mouse], ['快捷鍵', keys]]) {
+                try { fn(pick); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', k, e); }
+                await wait(600);
+                if (gone(box, pick)) { how = k; break; }
+            }
             const key = 'allowlog:' + cm[1], logs = M.load(key, []);
             const d = new Date(), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-            logs.push({ time: hm, what: label(pick) + '：' + what.slice(0, 40) }); M.save(key, logs.slice(-50));
-            console.log('[ClaudeChatTools] 自動允許：', label(pick), what);
+            logs.push({ time: hm, what: name + '（' + (how || '代按失敗') + '）：' + what.slice(0, 40) }); M.save(key, logs.slice(-50));
+            console.log('[ClaudeChatTools] 自動允許：', name, how || '代按失敗（卡片沒有消失）', what);
         }
         function scan() {
             const M = TOOLS.meter; if (!M || !M.opts().autoAllow) return;
