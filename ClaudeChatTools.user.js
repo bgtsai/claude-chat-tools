@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.5.0
+// @version      0.5.1
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.5.0';
+    const TOOLS_VERSION = '0.5.1';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -272,7 +272,7 @@
     const SUG_RE = /^〔建議交接〕(.*)$/;
     const MEASURE_RE = /^〔量用量〕/;   // v0.5.0：Claude 要準確用量時寫這行，腳本送 /context 再補送〔自動〕已校正用量（Claude 要求）
     const AUTO_PREFIX = '〔自動〕';
-    const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false };
+    const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false, allowRec: false };
     const opts = () => Object.assign({}, OPT_DEF, load('opt', {}));
     const setOpt = (k, v) => { const o = load('opt', {}); o[k] = v; save('opt', o); render(); };
     const effOnStop = o => (o.thr >= 0.85 ? 'draft' : o.onStop); // 85% 時剩下的空間來不及歸檔
@@ -603,6 +603,16 @@
             }
         }
         s3.append(small('只會按 claude.ai 畫面上的「允許」按鈕（有「一律允許」就按它）；需要你在對話裡親口同意的授權，腳本處理不了'));
+        // v0.5.1 臨時：錄製授權視窗（只錄不按），拿到真實結構、改好選擇器後拿掉
+        const recs = load('allowrec', []);
+        s3.append(head('錄製授權視窗（只錄不按）', '已錄 ' + recs.length + ' 筆', toggle(d, o.allowRec, false, v => setOpt('allowRec', v), '錄製授權視窗')));
+        if (recs.length) {
+            const row = div('margin-top:6px;display:flex;gap:12px');
+            const mk = (t, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.style.cssText = 'padding:0;border:0;background:none;font:inherit;font-size:13px;color:' + dim + ';text-decoration:underline;cursor:pointer'; b.addEventListener('click', e => { e.stopPropagation(); fn(b); }); return b; };
+            row.append(mk('複製錄到的內容', b => navigator.clipboard.writeText(JSON.stringify(load('allowrec', []), null, 1)).then(() => { b.textContent = '已複製'; }, () => { b.textContent = '複製失敗'; })),
+                mk('清除', () => { save('allowrec', []); renderPanel(); }));
+            s3.append(row);
+        }
         out.push(s3);
         return out;
     }
@@ -1559,7 +1569,25 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
                 console.log('[ClaudeChatTools] 自動允許：', label(pick), what);
             }
         }
+        // v0.5.1 錄製：不限 /chat/ 網址（Claude Code 的對話是 /code/session_…，scan() 的 CHAT 比對會直接跳過——疑似沒按到的原因）
+        const RECX = /允許|拒絕|核准|同意|Allow|Deny|Approve|Reject|Decline|Always|Confirm/i, recSeen = new WeakSet();
+        function rec() {
+            const M = TOOLS.meter; if (!M || !M.opts().allowRec) return;
+            const cands = [...document.querySelectorAll('button,[role="button"]')].filter(b => !b.closest(OWN) && !recSeen.has(b) && RECX.test(label(b) || b.getAttribute('aria-label') || ''));
+            if (!cands.length) return;
+            const logs = M.load('allowrec', []);
+            for (const b of cands) {
+                recSeen.add(b);
+                let c = b; for (let i = 0; i < 8 && c.parentElement; i++) { c = c.parentElement; if (c.querySelectorAll('button').length >= 2 && (c.innerText || '').length > 30) break; }
+                logs.push({ at: new Date().toISOString(), url: location.pathname, label: label(b), btn: b.outerHTML.slice(0, 1500),
+                    btns: [...c.querySelectorAll('button')].slice(0, 8).map(x => ({ t: label(x).slice(0, 60), a: [...x.attributes].map(a => a.name + '=' + a.value.slice(0, 100)) })),
+                    roles: [...new Set([...document.querySelectorAll('[role=dialog],[role=alertdialog]')].map(x => x.outerHTML.slice(0, 300)))],
+                    box: c.outerHTML.slice(0, 12000) });
+            }
+            M.save('allowrec', logs.slice(-10));
+            console.log('[ClaudeChatTools] 錄到授權類按鈕', cands.map(label));
+        }
         let tm = null;
-        new MutationObserver(() => { if (tm) return; tm = setTimeout(() => { tm = null; try { scan(); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); } }, 300); }).observe(document.body, { childList: true, subtree: true });
+        new MutationObserver(() => { try { rec(); } catch (e) { console.log('[ClaudeChatTools] 錄製失敗', e); } if (tm) return; tm = setTimeout(() => { tm = null; try { scan(); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); } }, 300); }).observe(document.body, { childList: true, subtree: true });
     });
 })();

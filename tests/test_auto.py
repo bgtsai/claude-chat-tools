@@ -68,6 +68,9 @@ with sync_playwright() as p:
     chk('記錄',pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowlog:%s')||'[]').length"%CID)==1);b.close()
     b,pg=page(p,name,base(),pre=box)
     chk('預設關不按',pg.evaluate('window.__c||[]')==[]);b.close()
+    b,pg=page(p,name,base(),opt={'allowRec':True},pre=box)
+    pg.wait_for_timeout(800);r=pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowrec')||'[]')")
+    chk('錄製：只錄不按',pg.evaluate('window.__c||[]')==[] and len(r)==4 and '一律允許' in r[1]['box'] and r[1]['url'].startswith('/'),[len(r),pg.evaluate('window.__c||[]')]);b.close()
     # 手動〔校正〕後也補送
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300);pg.click('.ccm-calib');pg.wait_for_timeout(2500)
