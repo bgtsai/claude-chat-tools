@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude 對話工具
 // @namespace    https://github.com/bgtsai/claude-chat-tools
-// @version      0.5.3
+// @version      0.6.0
 // @description  claude.ai 對話工具：上下文用量（頁首標籤、詳細面板、底部燈帶、送出時附用量標記）、/context 方格圖、交接對話串。合併自 claude-context-meter、claude-context-usage-grid、claude-chat-handover
 // @author       bgtsai
 // @match        https://claude.ai/*
@@ -17,7 +17,7 @@
 // 用量沿用舊前綴 ccm:（localStorage），舊設定不用搬；交接只用 sessionStorage，方格圖不存東西。
 (function () {
     'use strict';
-    const TOOLS_VERSION = '0.5.3';
+    const TOOLS_VERSION = '0.6.0';
     const TOOLS = {}; // 模組之間的介面：handover.run（交接模組）、meter（用量模組的 state 與設定）
     const whenReady = fn => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true }); else fn(); };
 
@@ -272,7 +272,7 @@
     const SUG_RE = /^〔建議交接〕(.*)$/;
     const MEASURE_RE = /^〔量用量〕/;   // v0.5.0：Claude 要準確用量時寫這行，腳本送 /context 再補送〔自動〕已校正用量（Claude 要求）
     const AUTO_PREFIX = '〔自動〕';
-    const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false, allowRec: false };
+    const OPT_DEF = { thr: 0.80, onStop: 'handoff', autoHandoff: false, autoAllow: false };
     const opts = () => Object.assign({}, OPT_DEF, load('opt', {}));
     const setOpt = (k, v) => { const o = load('opt', {}); o[k] = v; save('opt', o); render(); };
     const effOnStop = o => (o.thr >= 0.85 ? 'draft' : o.onStop); // 85% 時剩下的空間來不及歸檔
@@ -602,17 +602,7 @@
                 s3.append(more);
             }
         }
-        s3.append(small('只會按 claude.ai 畫面上的「允許」按鈕（有「一律允許」就按它）；需要你在對話裡親口同意的授權，腳本處理不了'));
-        // v0.5.1 臨時：錄製授權視窗（只錄不按），拿到真實結構、改好選擇器後拿掉
-        const recs = load('allowrec', []);
-        s3.append(head('錄製授權視窗（只錄不按）', '已錄 ' + recs.length + ' 筆', toggle(d, o.allowRec, false, v => setOpt('allowRec', v), '錄製授權視窗')));
-        if (recs.length) {
-            const row = div('margin-top:6px;display:flex;gap:12px');
-            const mk = (t, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.style.cssText = 'padding:0;border:0;background:none;font:inherit;font-size:13px;color:' + dim + ';text-decoration:underline;cursor:pointer'; b.addEventListener('click', e => { e.stopPropagation(); fn(b); }); return b; };
-            row.append(mk('複製錄到的內容', b => navigator.clipboard.writeText(JSON.stringify(load('allowrec', []), null, 1)).then(() => { b.textContent = '已複製'; }, () => { b.textContent = '複製失敗'; })),
-                mk('清除', () => { save('allowrec', []); renderPanel(); }));
-            s3.append(row);
-        }
+        s3.append(small('授權卡出現時，自動送卡片上的快捷鍵（有「一律允許」就用它）；需要你在對話裡親口同意的授權，腳本處理不了'));
         out.push(s3);
         return out;
     }
@@ -1551,19 +1541,10 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
         // 授權卡可能是固定定位：offsetParent 會是 null，改用 getClientRects
         const shown = (b) => b && !b.disabled && b.getClientRects().length > 0;
         const DENY_SEL = 'button[aria-keyshortcuts="Escape"]';
-        // v0.5.3：實機上 pick.click() 被 claude.ai 忽略（2026-11-14：腳本按了兩次「一律允許此網站」，請求照樣逾時）。
-        // 依序試：完整滑鼠事件 → 焦點＋快捷鍵（卡片上標的 Ctrl(+Shift)+Enter）；每種等 0.6 秒看卡片有沒有消失。都沒效就記「代按失敗」、不再重試這張卡。
+        // v0.6.0：claude.ai 授權卡不接受 click() 也不接受模擬滑鼠（2026-11-14 實測：滑鼠 0.6 秒後卡片還在），只接受快捷鍵（卡片 aria-keyshortcuts：一律允許 Control+Shift+Enter、允許一次 Control+Enter）。
+        // 送一次、等 0.6 秒看卡片有沒有消失；沒消失就記「代按失敗」、不再重試這張卡（不檢查 isTrusted，事件照收）。
         const gone = (box, pick) => !box.isConnected || !pick.isConnected || !shown(pick);
         const wait = (ms) => new Promise(r => setTimeout(r, ms));
-        function mouse(b) {
-            const r = b.getBoundingClientRect(), o = { bubbles: true, cancelable: true, composed: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
-            const P = window.PointerEvent || MouseEvent, pd = { ...o, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-            b.dispatchEvent(new P('pointerover', pd)); b.dispatchEvent(new P('pointerenter', pd));
-            b.dispatchEvent(new P('pointerdown', { ...pd, buttons: 1 })); b.dispatchEvent(new MouseEvent('mousedown', { ...o, buttons: 1 }));
-            b.focus && b.focus();
-            b.dispatchEvent(new P('pointerup', pd)); b.dispatchEvent(new MouseEvent('mouseup', o));
-            b.dispatchEvent(new MouseEvent('click', o));
-        }
         function keys(b) {
             const ks = (b.getAttribute('aria-keyshortcuts') || 'Control+Enter').split('+');
             const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true, ctrlKey: ks.includes('Control'), shiftKey: ks.includes('Shift'), altKey: ks.includes('Alt'), metaKey: ks.includes('Meta') };
@@ -1581,11 +1562,9 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
             }
             const name = label(pick);
             let how = '';
-            for (const [k, fn] of [['滑鼠', mouse], ['快捷鍵', keys]]) {
-                try { fn(pick); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', k, e); }
-                await wait(600);
-                if (gone(box, pick)) { how = k; break; }
-            }
+            try { keys(pick); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); }
+            await wait(600);
+            if (gone(box, pick)) how = '快捷鍵';
             const key = 'allowlog:' + cm[1], logs = M.load(key, []);
             const d = new Date(), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
             logs.push({ time: hm, what: name + '（' + (how || '代按失敗') + '）：' + what.slice(0, 40) }); M.save(key, logs.slice(-50));
@@ -1616,25 +1595,7 @@ html.dark .${CARD_CLASS}, html[data-mode="dark"] .${CARD_CLASS}, html[data-theme
                 if (pick) done(box, pick, cm, M);
             }
         }
-        // v0.5.1 錄製：不限 /chat/ 網址（Claude Code 的對話是 /code/session_…，scan() 的 CHAT 比對會直接跳過——疑似沒按到的原因）
-        const RECX = /允許|拒絕|核准|同意|Allow|Deny|Approve|Reject|Decline|Always|Confirm/i, recSeen = new WeakSet();
-        function rec() {
-            const M = TOOLS.meter; if (!M || !M.opts().allowRec) return;
-            const cands = [...document.querySelectorAll('button,[role="button"]')].filter(b => !b.closest(OWN) && !recSeen.has(b) && RECX.test(label(b) || b.getAttribute('aria-label') || ''));
-            if (!cands.length) return;
-            const logs = M.load('allowrec', []);
-            for (const b of cands) {
-                recSeen.add(b);
-                let c = b; for (let i = 0; i < 8 && c.parentElement; i++) { c = c.parentElement; if (c.querySelectorAll('button').length >= 2 && (c.innerText || '').length > 30) break; }
-                logs.push({ at: new Date().toISOString(), url: location.pathname, label: label(b), btn: b.outerHTML.slice(0, 1500),
-                    btns: [...c.querySelectorAll('button')].slice(0, 8).map(x => ({ t: label(x).slice(0, 60), a: [...x.attributes].map(a => a.name + '=' + a.value.slice(0, 100)) })),
-                    roles: [...new Set([...document.querySelectorAll('[role=dialog],[role=alertdialog]')].map(x => x.outerHTML.slice(0, 300)))],
-                    box: c.outerHTML.slice(0, 12000) });
-            }
-            M.save('allowrec', logs.slice(-10));
-            console.log('[ClaudeChatTools] 錄到授權類按鈕', cands.map(label));
-        }
         let tm = null;
-        new MutationObserver(() => { try { rec(); } catch (e) { console.log('[ClaudeChatTools] 錄製失敗', e); } if (tm) return; tm = setTimeout(() => { tm = null; try { scan(); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); } }, 300); }).observe(document.body, { childList: true, subtree: true });
+        new MutationObserver(() => { if (tm) return; tm = setTimeout(() => { tm = null; try { scan(); } catch (e) { console.log('[ClaudeChatTools] 自動允許失敗', e); } }, 300); }).observe(document.body, { childList: true, subtree: true });
     });
 })();

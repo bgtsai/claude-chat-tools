@@ -2,7 +2,8 @@
 
 2026-11-13 在「小程式集合」對話串定案（那串原本在做 VoiceInputTW v1.7.0）。新 repo 建好後，把這份搬進新 repo 根目錄的 CLAUDE.md，這個分支資料夾就可以刪。
 
-## 目前狀態（2026-11-14）
+## 目前狀態（2026-11-17）
+- v0.6.0：自動允許實機成功（2026-11-14 12:05，讀 greasespot.net 的授權卡，紀錄「一律允許此網站（快捷鍵）」）。claude.ai 授權卡不接受 `click()`、也不接受模擬滑鼠事件，只接受快捷鍵（不檢查 isTrusted）：只留快捷鍵（讀卡片 `aria-keyshortcuts` 照送，焦點在按鈕上、只送一次），0.6 秒後卡片沒消失記「代按失敗」。拿掉錄製模式（`allowRec`、`ccm:allowrec`、面板開關）。加 repo 的授權沒實測到：讀公開 repo 不需要授權。
 - v0.5.3：實機上 `pick.click()` 被 claude.ai 忽略（Console 有「自動允許：一律允許此網站」兩次，請求照樣逾時）。改成依序試：完整滑鼠事件（pointerdown→mousedown→pointerup→mouseup→click，帶座標）→ 焦點＋卡片上標的快捷鍵（`aria-keyshortcuts`，只送一次：送到 activeElement 會冒泡到 document，兩邊都送會觸發兩次）；每種等 0.6 秒看卡片有沒有消失，紀錄寫「（滑鼠）／（快捷鍵）／（代按失敗）」。都失敗可能是 claude.ai 檢查 `isTrusted`，那就做不到。
 - v0.5.2：自動允許照真實授權卡（2026-11-14 錄到）改用屬性：`[data-approval-allow]` 裡，含 `[data-approval-lasting]` 的按鈕（一律允許此網站）優先，否則 `button[data-approval-primary]`（允許一次）；旁邊要有 `button[aria-keyshortcuts="Escape"]`（拒絕）。按鈕文字後面接快捷鍵提示（Ctrl／回车键 (⏎)／Enter），文字比對只取第一行（舊的 `^允許一次$` 因此比對不到）。紀錄的說明文字取容器裡去掉按鈕後的文字。網址比對加 `/code/`。錄製模式還留著，等加 repo 的授權卡也確認按得到再拿掉。v0.5.1 那條「scan() 只認 /chat/」：使用者頁面是 `/chat/…`，不是原因。
 - v0.5.1（臨時）：面板「錄製授權視窗（只錄不按）」開關＋「複製錄到的內容」，錄到 localStorage `ccm:allowrec`（最多 10 筆：按鈕、外層容器 HTML、所有按鈕屬性）。拿到真實結構、改好選擇器後拿掉。順便查到：自動允許的 scan() 只認 `/chat/` 網址，Claude Code 的對話是 `/code/session_…`，在那裡根本不會動作。
@@ -23,7 +24,7 @@
 - 用量沿用 localStorage `ccm:` 前綴，舊設定不用搬。新鍵：`ccm:opt`（thr／onStop／autoHandoff／autoAllow）、`cont:<cid>`（已回覆的〔續做〕訊息）、`autoctx:<cid>`（同一輪只送一次 /context）、`await:<cid>`（自動停下且要交接）、`ready:<cid>`、`ahn`（連續自動交接次數，手動交接歸零）、`allowlog:<cid>`。
 - 模組之間用外層的 `TOOLS`：`TOOLS.meter`（state、opts、load/save）、`TOOLS.handover.run(text, {auto})`。
 - 測試：`cd tests && python3 server.py &`，再 `python3 test.py ../ClaudeChatTools.user.js`、`test_ui.py`、`test_tag.py`、`test_auto.py`（同參數，30 項×2 引擎）、`test_estimate.py`（同參數，11 項×2 引擎）、`python3 test_grid.py`、`python3 test_handover.py chromium firefox`（40 項）。test_auto 的 9 條規則都用改壞版反證過。
-- **還沒做**：換串成本實測（交接前後量新舊串的工具呼叫成本，存 `ccm:hcost`）——v0.4.0 起腳本不再自己判斷換串，實測值之後給 Claude 估 N* 用；/context 輸出只解析一次（用量讀對話樹、方格圖讀畫面，來源不同，暫不合）；真實頁面實測（含授權按鈕的真實樣子）。
+- **還沒做**：（自動允許已實測成功，見 v0.6.0）換串成本實測（交接前後量新舊串的工具呼叫成本，存 `ccm:hcost`）——v0.4.0 起腳本不再自己判斷換串，實測值之後給 Claude 估 N* 用；/context 輸出只解析一次（用量讀對話樹、方格圖讀畫面，來源不同，暫不合）；真實頁面實測（含授權按鈕的真實樣子）。
 - 知識庫 01 第⑫條：v2.54 補上〔建議交接〕寫法（2026-11-13）；換串公式本身（工具呼叫算一輪、換串成本實測）還沒改。
 
 ## Claude 這邊怎麼配合（腳本認的格式）

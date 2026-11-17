@@ -63,23 +63,24 @@ with sync_playwright() as p:
     b,pg=page(p,name,base(('assistant','做中')),pre="localStorage.setItem('ccm:await:%s','\"manual\"')"%CID)
     chk('等待中按鈕文字',pg.evaluate("document.querySelector('.cho-btn').textContent.trim()")=='交接準備中…',pg.evaluate("document.querySelector('.cho-btn').textContent.trim()"));b.close()
     # 自動允許
+    KB="document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey&&document.activeElement&&document.activeElement.onclick)document.activeElement.onclick()});"   # v0.6.0：真實授權卡只認快捷鍵，夾具照樣：快捷鍵觸發焦點所在的按鈕
     box="document.addEventListener('DOMContentLoaded',()=>{const d=document.createElement('div');d.innerHTML='<p>Claude 要讀取 bgtsai/x</p><button onclick=\"window.__c=(window.__c||[]).concat(1)\">允許一次</button><button onclick=\"window.__c=(window.__c||[]).concat(2)\">一律允許</button><button>拒絕</button>';document.body.append(d);const e=document.createElement('div');e.innerHTML='<button onclick=\"window.__c=(window.__c||[]).concat(9)\">Allow</button>';document.body.append(e)})"
-    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=box)
+    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=KB+box)
     chk('優先按一律允許、沒有拒絕鈕的不按',pg.evaluate('window.__c||[]')==[2],pg.evaluate('window.__c||[]'))
     chk('記錄',pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowlog:%s')||'[]').length"%CID)==1);b.close()
     b,pg=page(p,name,base(),pre=box)
     chk('預設關不按',pg.evaluate('window.__c||[]')==[]);b.close()
     # v0.5.2：照真實授權卡（固定定位、按鈕文字帶快捷鍵提示、用 data-approval-* 屬性）
     real="document.addEventListener('DOMContentLoaded',()=>{const d=document.createElement('div');d.style.cssText='position:fixed;bottom:0;left:0';d.innerHTML='<div><p>Claude 想讀取 www.example.com</p><div><span><span><button type=\"button\" aria-keyshortcuts=\"Escape\" data-approval-variant=\"secondary\" onclick=\"window.__c=(window.__c||[]).concat(0)\">拒絕<kbd style=\\\"display:block\\\">Esc</kbd></button></span></span><div data-approval-allow=\"\"><button type=\"button\" aria-keyshortcuts=\"Control+Shift+Enter\" onclick=\"window.__c=(window.__c||[]).concat(2)\"><span data-approval-digit=\"2\" data-approval-lasting=\"\">一律允許此網站</span><kbd style=\\\"display:block\\\">Ctrl</kbd><kbd style=\\\"display:block\\\">Enter</kbd></button><button type=\"button\" data-approval-primary=\"\" aria-keyshortcuts=\"Control+Enter\" onclick=\"window.__c=(window.__c||[]).concat(1)\"><span data-approval-digit=\"3\">允許一次</span><kbd style=\\\"display:block\\\">Ctrl</kbd><kbd style=\\\"display:block\\\">Enter</kbd></button></div></div></div>';document.body.append(d)})"
-    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=real)
+    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=KB+real)
     pg.wait_for_timeout(1500)
     lg=pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowlog:%s')||'[]')"%CID)
     chk('真實授權卡：按一律允許此網站一次',pg.evaluate('window.__c||[]')==[2] and len(lg)==1 and '一律允許此網站' in lg[0]['what'] and 'example.com' in lg[0]['what'],[pg.evaluate('window.__c||[]'),lg]);b.close()
     real1=re.sub(r'<button[^>]*Control\+Shift\+Enter.*?</button>','',real)
     assert real1!=real
-    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=real1)
+    b,pg=page(p,name,base(),opt={'autoAllow':True},pre=KB+real1)
     chk('真實授權卡：沒有一律允許就按允許一次',pg.evaluate('window.__c||[]')==[1],pg.evaluate('window.__c||[]'));b.close()
-    # v0.5.3：實機上 click() 被忽略 → 依序試滑鼠事件、快捷鍵；卡片消失才算成功
+    # v0.6.0：真實授權卡只認快捷鍵（2026-11-14 實測）；卡片消失才算成功
     card=lambda mode:"""document.addEventListener('DOMContentLoaded',()=>{const d=document.createElement('div');d.id='card';d.style.cssText='position:fixed;bottom:0';
       const deny=document.createElement('button');deny.setAttribute('aria-keyshortcuts','Escape');deny.textContent='拒絕';
       const g=document.createElement('div');g.setAttribute('data-approval-allow','');
@@ -91,13 +92,10 @@ with sync_playwright() as p:
       if(M==='pd')L.addEventListener('pointerdown',()=>hit('pd'));
       if(M==='key')document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey&&e.shiftKey)hit('key')});
     })"""%mode
-    for mode,want,how in [('pd',['pd'],'滑鼠'),('key',['key'],'快捷鍵'),('none',[],'代按失敗')]:
+    for mode,want,how in [('key',['key'],'快捷鍵'),('none',[],'代按失敗')]:
         b,pg=page(p,name,base(),opt={'autoAllow':True},pre=card(mode));pg.wait_for_timeout(2000)
         lg=pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowlog:%s')||'[]')"%CID)
         chk('代按方式：'+how,pg.evaluate('window.__c||[]')==want and len(lg)==1 and ('（%s）'%how) in lg[0]['what'] and 'a.com' in lg[0]['what'],[pg.evaluate('window.__c||[]'),lg]);b.close()
-    b,pg=page(p,name,base(),opt={'allowRec':True},pre=box)
-    pg.wait_for_timeout(800);r=pg.evaluate("JSON.parse(localStorage.getItem('ccm:allowrec')||'[]')")
-    chk('錄製：只錄不按',pg.evaluate('window.__c||[]')==[] and len(r)==4 and '一律允許' in r[1]['box'] and r[1]['url'].startswith('/'),[len(r),pg.evaluate('window.__c||[]')]);b.close()
     # 手動〔校正〕後也補送
     b,pg=page(p,name,base(('assistant','好')))
     pg.click('#ccm-badge');pg.wait_for_timeout(300);pg.click('.ccm-calib');pg.wait_for_timeout(2500)
