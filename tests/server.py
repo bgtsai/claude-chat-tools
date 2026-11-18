@@ -31,10 +31,14 @@ class H(http.server.BaseHTTPRequestHandler):
         p=self.path
         if p.startswith('/mode/'):MODE['tree']=p[6:];MODE['custom']=None;self._s(b'ok','text/plain')
         elif p.startswith('/chat/'):self._s(PAGE.encode(),'text/html')
+        elif p.endswith('/usage'):self._s((MODE.get('usage') or '{}').encode(),'application/json')   # v0.7.0 額度冷卻：用量端點
         elif '/chat_conversations/' in p:self._s(json.dumps(tree(p)).encode(),'application/json')
         else:self._s(b'{}','application/json')
     def do_POST(self):
-        n=int(self.headers.get('content-length',0)); MODE['custom']=self.rfile.read(n).decode() or None; self._s(b'ok','text/plain')
+        n=int(self.headers.get('content-length',0)); body=self.rfile.read(n).decode()
+        if self.path=='/usage': MODE['usage']=body or None
+        else: MODE['custom']=body or None
+        self._s(b'ok','text/plain')
     def _s(self,b,ct):
         self.send_response(200);self.send_header('content-type',ct);self.send_header('content-length',str(len(b)));self.end_headers();self.wfile.write(b)
 class S(socketserver.ThreadingMixIn,http.server.HTTPServer):daemon_threads=True;allow_reuse_address=True
